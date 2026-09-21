@@ -2015,6 +2015,7 @@ class Consumer:
         self.ctx, self.store = ctx, store
         self.decision_fn = decision_fn or self._decision
         self._threads: set[threading.Thread] = set()
+        self._review_requested = False
         self._lock = threading.RLock()
         self.scope_guard: DefaultScopeGuard | None = None
 
@@ -2233,18 +2234,27 @@ class Consumer:
                 results.append(updated)
         return results
 
-    def post_tool_call(self, **kwargs: Any) -> None:
-        def worker() -> None:
+    def _review_worker(self) -> None:
+        while True:
+            with self._lock:
+                self._review_requested = False
             try:
-                self.process_pending()
+                while self.process_pending():
+                    pass
             except Exception:
                 log.warning("Jev bridge consumer skipped advisory; no retry or authority change", exc_info=True)
-            finally:
-                with self._lock:
-                    self._threads.discard(threading.current_thread())
+            with self._lock:
+                if self._review_requested:
+                    continue
+                self._threads.discard(threading.current_thread())
+                return
 
-        thread = threading.Thread(target=worker, daemon=True, name="jev-bridge-review")
+    def post_tool_call(self, **kwargs: Any) -> None:
         with self._lock:
+            self._review_requested = True
+            if self._threads:
+                return
+            thread = threading.Thread(target=self._review_worker, daemon=True, name="jev-bridge-review")
             self._threads.add(thread)
         try:
             thread.start()

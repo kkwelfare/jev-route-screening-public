@@ -283,6 +283,50 @@ class WorkerConsumerProofTests(unittest.TestCase):
                     self.assertNotIn(thread, consumer._threads)
                     self.assertEqual(consumer._threads, set())
 
+    def test_consumer_coalesces_post_tool_burst_to_one_worker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jev-thread-burst-regression-") as temporary:
+            root = Path(temporary)
+            consumer = bridge.Consumer(
+                FakeContext("default", root, "consumer"),
+                bridge.BridgeStore(root),
+            )
+            started = threading.Event()
+            release = threading.Event()
+            state_lock = threading.Lock()
+            active = 0
+            max_active = 0
+            calls = 0
+
+            def bounded_process_pending() -> None:
+                nonlocal active, max_active, calls
+                with state_lock:
+                    calls += 1
+                    active += 1
+                    max_active = max(max_active, active)
+                    started.set()
+                release.wait(timeout=2.0)
+                with state_lock:
+                    active -= 1
+
+            consumer.process_pending = bounded_process_pending
+            for _ in range(50):
+                consumer.post_tool_call(tool_name="thread-burst-probe")
+
+            self.assertTrue(started.wait(timeout=1.0))
+            with consumer._lock:
+                threads = list(consumer._threads)
+            self.assertEqual(len(threads), 1)
+            self.assertEqual(sum(thread.is_alive() for thread in threads), 1)
+
+            release.set()
+            threads[0].join(timeout=2.0)
+            self.assertFalse(threads[0].is_alive())
+            with consumer._lock:
+                self.assertEqual(consumer._threads, set())
+            with state_lock:
+                self.assertEqual(max_active, 1)
+                self.assertGreaterEqual(calls, 2, "a burst during processing must request one follow-up scan")
+
     def test_consumer_processes_more_than_daily_cap_across_distinct_runs_offline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="jev-daily-cap-regression-") as temporary:
             root = Path(temporary)
