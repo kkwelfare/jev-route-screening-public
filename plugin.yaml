@@ -1,0 +1,12 @@
+name: jev-route-screening
+version: 0.4.0
+description: Common Jev checkpoint bridge with advisory targeted hermes-agent reading
+provides_tools:
+  - jev_bridge_checkpoint
+  - jev_bridge_review
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - transform_tool_result
+  - on_kanban_worker_spawned
