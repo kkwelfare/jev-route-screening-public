@@ -2239,9 +2239,19 @@ class Consumer:
                 self.process_pending()
             except Exception:
                 log.warning("Jev bridge consumer skipped advisory; no retry or authority change", exc_info=True)
+            finally:
+                with self._lock:
+                    self._threads.discard(threading.current_thread())
+
         thread = threading.Thread(target=worker, daemon=True, name="jev-bridge-review")
-        self._threads.add(thread)
-        thread.start()
+        with self._lock:
+            self._threads.add(thread)
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self._threads.discard(thread)
+            raise
 
 
 def _schema() -> dict[str, Any]:

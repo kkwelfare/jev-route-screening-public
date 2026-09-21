@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -243,6 +244,44 @@ class WorkerConsumerProofTests(unittest.TestCase):
             )
             self.assertNotIn(secret_sentinel, persisted)
             self.assertNotIn(secret_sentinel, json.dumps(event, ensure_ascii=False, sort_keys=True))
+
+    def test_consumer_discards_finished_post_tool_threads(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jev-thread-cleanup-regression-") as temporary:
+            root = Path(temporary)
+            for should_fail in (False, True):
+                started = threading.Event()
+                release = threading.Event()
+                consumer = bridge.Consumer(
+                    FakeContext("default", root, "consumer"),
+                    bridge.BridgeStore(root),
+                )
+
+                def bounded_process_pending(fails: bool = should_fail) -> None:
+                    started.set()
+                    if not release.wait(timeout=2.0):
+                        raise AssertionError("thread cleanup probe was not released")
+                    if fails:
+                        raise RuntimeError("thread cleanup probe")
+
+                consumer.process_pending = bounded_process_pending
+                consumer.post_tool_call(tool_name="thread-cleanup-probe")
+                self.assertTrue(started.wait(timeout=1.0))
+                with consumer._lock:
+                    threads = list(consumer._threads)
+                self.assertEqual(len(threads), 1)
+                thread = threads[0]
+
+                if should_fail:
+                    with self.assertLogs(bridge.log, level="WARNING"):
+                        release.set()
+                        thread.join(timeout=2.0)
+                else:
+                    release.set()
+                    thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+                with consumer._lock:
+                    self.assertNotIn(thread, consumer._threads)
+                    self.assertEqual(consumer._threads, set())
 
     def test_consumer_processes_more_than_daily_cap_across_distinct_runs_offline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="jev-daily-cap-regression-") as temporary:
