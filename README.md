@@ -15,7 +15,7 @@ The route labels and reference manifest are local allowlisted values. A Jev resp
 
 Jev is advisory only. Hermes, the dispatcher, the normal skill loader, the task contract, and the default profile retain authority. The local manifest maps route labels to repository-relative reference paths; an untrusted provider response is never used as a file path.
 
-Requests and persisted projections are bounded and redacted. The bridge records hashes, labels, counts, status, route metadata, and allowlisted evidence references rather than raw user messages, tool arguments, provider credentials, or provider response content. Provider API keys are read only from the named environment variables at runtime and are never printed by this repository.
+Local runtime records are bounded and metadata-redacted: the bridge avoids persisting raw tool arguments, provider credentials, or provider response content in its normal ledger records, while some bounded task-contract text and evidence references may be stored locally. Provider request envelopes still carry bounded request text and selected structured context; this candidate does not provide general PII or secret scrubbing before provider submission. Provider API keys are read only from the named environment variables at runtime and are never printed by this repository.
 
 The default scope guard is a separate safety path. A high-confidence `scope_drift` result at or above the configured `0.8` threshold can create a provisional default stop and require a matching default readback. Low-confidence or unknown-confidence results, malformed responses, timeouts, and other advisory failures remain fail-open so the original host flow is preserved. The required `pre_tool_call` scope-guard hook is therefore intentional and must not be removed to make the transform seam test pass.
 
@@ -66,7 +66,7 @@ The tests use fixtures and mock callbacks only. Running this repository's tests 
 
 ## Local persistence
 
-`bridge_dir` contains local JSONL state such as worker events, reservations/ledger rows, reviews, delivery records, triggers, controls, diagnostics, worker bindings, default-scope outcomes, and targeted-reading advisory/observation rows. The implementation creates the directory with mode `0700` and JSONL files with mode `0600` where the host permits it. These files are runtime state, not release artifacts; do not commit them or include them in an external share.
+`bridge_dir` contains local JSONL state such as worker events, reservations/ledger rows, reviews, delivery records, triggers, controls, diagnostics, worker bindings, default-scope outcomes, and targeted-reading advisory/observation rows. The implementation creates the directory with mode `0700` and JSONL files with mode `0600` where the host permits it. These files are runtime state, not release artifacts; do not commit them or include them in an external share. This candidate does not define a general retention or pruning policy, so operators must choose the directory and retention period deliberately.
 
 ## Host compatibility
 
