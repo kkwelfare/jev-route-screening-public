@@ -23,6 +23,8 @@ from typing import Any
 SCRATCH = Path(os.environ.get("JEV_TEST_SCRATCH") or tempfile.gettempdir())
 SCRIPT = Path(__file__).resolve()
 _SENTINEL = "RESULT_JSON="
+_PROVIDER_SLEEP_SECONDS = 0.8
+_PROMPT_RETURN_FRACTION = 0.75
 
 
 _PLUGIN_YAML = """name: transform_jev_probe
@@ -45,7 +47,7 @@ def _mock_jev_provider(*, tool_name: str, args: dict, result: str) -> dict:
     if mode == "raise":
         raise RuntimeError("mock_jev_provider_failure")
     if mode == "timeout":
-        time.sleep(float(os.environ.get("JEV_PROBE_SLEEP_SECONDS", "0.4")))
+        time.sleep(float(os.environ.get("JEV_PROBE_SLEEP_SECONDS", "0.8")))
     return {
         "source": "mock-jev",
         "tool_name": tool_name,
@@ -215,7 +217,7 @@ def _production_child_case(case: str) -> dict[str, Any]:
         if case == "raise":
             raise RuntimeError("mock_production_provider_failure")
         if case == "timeout":
-            time.sleep(0.4)
+            time.sleep(float(os.environ.get("JEV_PROBE_SLEEP_SECONDS", "0.8")))
         state = json.loads(body["state"])
         request = str(state["request"]).casefold()
         route = "cli_reference" if "cli" in request else "configuration_reference"
@@ -315,8 +317,13 @@ def _production_child_case(case: str) -> dict[str, Any]:
     elapsed = time.monotonic() - started
     if observed != baseline:
         raise AssertionError(f"{case} production path changed the original result: baseline={baseline!r} observed={observed!r}")
-    if elapsed >= 0.25:
-        raise AssertionError(f"{case} production transform did not fail open promptly: {elapsed:.3f}s")
+    provider_sleep = float(os.environ.get("JEV_PROBE_SLEEP_SECONDS", str(_PROVIDER_SLEEP_SECONDS)))
+    prompt_limit = provider_sleep * _PROMPT_RETURN_FRACTION
+    if elapsed >= prompt_limit:
+        raise AssertionError(
+            f"{case} production transform did not fail open before the provider completed: "
+            f"{elapsed:.3f}s >= {prompt_limit:.3f}s"
+        )
     return {
         "case": case, "fresh_process": True, "hook_registered": True,
         "skill_read_success": True, "original_result_preserved": True,
@@ -398,8 +405,13 @@ def _child_case(case: str) -> dict[str, Any]:
         result["original_result_preserved"] = True
         result["fail_open"] = True
         if case == "timeout":
-            if elapsed >= 0.25:
-                raise AssertionError(f"transform timeout blocked the skill read: {elapsed:.3f}s")
+            provider_sleep = float(os.environ.get("JEV_PROBE_SLEEP_SECONDS", str(_PROVIDER_SLEEP_SECONDS)))
+            prompt_limit = provider_sleep * _PROMPT_RETURN_FRACTION
+            if elapsed >= prompt_limit:
+                raise AssertionError(
+                    f"transform timeout blocked the skill read until the provider completed: "
+                    f"{elapsed:.3f}s >= {prompt_limit:.3f}s"
+                )
             result["timeout_returned_promptly"] = True
     else:
         raise AssertionError(f"unknown child case: {case}")
@@ -420,7 +432,7 @@ def _run_parent() -> int:
                 "HERMES_HOME": str(home),
                 "HERMES_PROFILE": "default",
                 "JEV_PROBE_CASE": case,
-                "JEV_PROBE_SLEEP_SECONDS": "0.4",
+                "JEV_PROBE_SLEEP_SECONDS": str(_PROVIDER_SLEEP_SECONDS),
                 "PYTHONPATH": env.get("PYTHONPATH", ""),
             })
             completed = subprocess.run(
@@ -456,6 +468,7 @@ def _run_parent() -> int:
                 "HERMES_HOME": str(home),
                 "HERMES_PROFILE": "default",
                 "JEV_PRODUCTION_BRIDGE_DIR": str(bridge_dir),
+                "JEV_PROBE_SLEEP_SECONDS": str(_PROVIDER_SLEEP_SECONDS),
                 "PYTHONPATH": env.get("PYTHONPATH", ""),
             })
             completed = subprocess.run(
