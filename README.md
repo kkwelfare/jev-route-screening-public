@@ -1,6 +1,6 @@
 # Jev route screening
 
-This repository is a clean, local sharing candidate for the Jev route-screening Hermes plugin. It contains the selected bridge/router implementation, the plugin manifest, and bounded offline tests. It is intentionally experimental: it is not a release, does not configure a remote, and makes no license claim.
+This repository is a clean, local sharing candidate for the Jev route-screening Hermes plugin. It contains the selected bridge/router implementation, the plugin manifest, and bounded offline tests. It is intentionally experimental: it is not a release and does not configure a remote. The repository is licensed under the MIT License; public publication and production use remain separate decisions.
 
 ## What it does
 
@@ -89,4 +89,4 @@ The transform probe covers success, provider exception, timeout/fail-open, fresh
 
 ## Experimental status and sharing boundary
 
-This is an experimental local candidate for review. It has no remote and no publication metadata. Decide licensing, public release, credential provisioning, provider policy, and production enablement separately; none of those decisions are implied by this repository.
+This is an experimental local candidate for review. It has no remote and no publication metadata. The repository license is MIT; public release, credential provisioning, provider policy, and production enablement remain separate decisions and are not implied by this repository.
