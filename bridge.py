@@ -2051,7 +2051,13 @@ class DefaultScopeGuard:
         pending_default = self._pending_default_trigger(session_identity)
         if pending_default is not None:
             return self._block_for_existing_stop(pending_default, session_identity)
-        trigger = self._pending_trigger()
+        # Worker triggers already belong to the worker provisional-stop review
+        # path. They must not be screened as default actions: doing so creates
+        # default-scope rows/controls for a worker trigger and can turn a later
+        # call from another session into a false identity mismatch.
+        if self._pending_trigger() is not None:
+            return None
+        trigger = None
         contract: dict[str, Any] | None = None
         if trigger is None:
             contract = self._contract_for(session_identity, turn_identity)

@@ -102,6 +102,30 @@ class DefaultScopeGuardTests(unittest.TestCase):
             )
         return store, consumer, guard, trigger
 
+    def _make_default(self, decision_fn, *, tool_name: str, action_args: dict[str, Any], session_id: str, turn_id: str):
+        temporary = tempfile.TemporaryDirectory(prefix="jev-default-request-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = bridge.BridgeStore(root)
+        context = FakeContext(root)
+        consumer = bridge.Consumer(context, store)
+        guard = bridge.DefaultScopeGuard(context, store, decision_fn=decision_fn)
+        guard.attach_consumer(consumer)
+        consumer.scope_guard = guard
+        guard.pre_llm_call(
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message="complete the bounded default readback",
+            completion_conditions=["read only", "record the exact readback"],
+        )
+        session_identity, turn_identity = bridge._scope_identity(session_id, turn_id)
+        contract = guard._contract_for(session_identity, turn_identity)
+        self.assertIsNotNone(contract)
+        action = bridge._default_scope_action(tool_name, action_args)
+        self.assertIsNotNone(action)
+        trigger = guard._default_trigger(contract or {}, action or {})
+        return store, consumer, guard, trigger
+
     @staticmethod
     def _scope_drift(_request: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -112,7 +136,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
         }
 
     def test_scope_drift_blocks_before_tool_and_matching_readback_releases(self) -> None:
-        store, consumer, guard, trigger = self._make(self._scope_drift)
+        store, consumer, guard, trigger = self._make_default(
+            self._scope_drift,
+            tool_name="write_file",
+            action_args={"path": "readback.txt", "content": "MUST_NOT_PERSIST"},
+            session_id="default-session-1",
+            turn_id="turn-1",
+        )
         first = guard.pre_tool_call(
             "write_file",
             {"path": "readback.txt", "content": "MUST_NOT_PERSIST"},
@@ -126,6 +156,14 @@ class DefaultScopeGuardTests(unittest.TestCase):
         self.assertIn("masterへ示して確認する", first["message"])
         self.assertEqual(len([row for row in store.default_scopes() if row.get("state") == "candidate"]), 1)
         self.assertEqual(len([row for row in store.controls() if row.get("scope") == "default"]), 1)
+        with store.interprocess_lock():
+            consumer._append_control_locked(
+                trigger,
+                "provisional_stop",
+                source="jev",
+                reason="independent worker fixture",
+                scope="worker",
+            )
 
         duplicate = guard.pre_tool_call(
             "write_file",
@@ -167,6 +205,46 @@ class DefaultScopeGuardTests(unittest.TestCase):
             )
         )
         self.assertIsNotNone(bridge._active_scope_control(store, trigger, scope="worker"))
+
+    def test_worker_trigger_stays_on_worker_review_route_without_default_identity_block(self) -> None:
+        store, consumer, guard, trigger = self._make(self._scope_drift)
+        calls: list[dict[str, Any]] = []
+
+        def unexpected_default_screen(request: dict[str, Any]) -> dict[str, Any]:
+            calls.append(request)
+            return self._scope_drift(request)
+
+        guard.decision_fn = unexpected_default_screen
+        result = guard.pre_tool_call(
+            "read_file",
+            {"path": "worker-readback.txt"},
+            session_id="different-default-session",
+            turn_id="worker-turn-1",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertEqual(store.default_scopes(), [])
+        self.assertIsNone(bridge._active_scope_control(store, trigger, scope="default"))
+        self.assertIsNotNone(bridge._active_scope_control(store, trigger, scope="worker"))
+
+        pending = json.loads(consumer.review_tool(args={}, session_id="default-session"))
+        self.assertEqual([row["trigger_id"] for row in pending], [trigger["trigger_id"]])
+        worker_readback = _readback(trigger, session_id="default-session", turn_id="worker-review")
+        worker_readback["scope"] = "worker"
+        released = json.loads(
+            consumer.review_tool(
+                args={
+                    "scope": "worker",
+                    "trigger_id": trigger["trigger_id"],
+                    "decision": "no_intervention",
+                    "readback": worker_readback,
+                },
+                session_id="default-session",
+            )
+        )
+        self.assertEqual(released["state"], "no_intervention")
+        self.assertIsNone(bridge._active_scope_control(store, trigger, scope="worker"))
+        self.assertIsNone(bridge._active_scope_control(store, trigger, scope="default"))
 
     def test_default_request_is_screened_without_worker_trigger(self) -> None:
         calls: list[dict[str, Any]] = []
@@ -275,7 +353,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
             calls.append(request)
             return {"label": "insufficient_information", "confidence": 0.25, "reason": "bounded action context is incomplete"}
 
-        store, _consumer, guard, trigger = self._make(insufficient)
+        store, _consumer, guard, trigger = self._make_default(
+            insufficient,
+            tool_name="read_file",
+            action_args={"path": "config.yaml"},
+            session_id="s",
+            turn_id="t",
+        )
         self.assertIsNone(guard.pre_tool_call("read_file", {"path": "config.yaml"}, session_id="s", turn_id="t"))
         self.assertIsNone(guard.pre_tool_call("read_file", {"path": "config.yaml"}, session_id="s", turn_id="t"))
         self.assertEqual(len(calls), 1, "same action/session must be deduplicated")
@@ -285,7 +369,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
         def timeout(_request: dict[str, Any]) -> dict[str, Any]:
             raise bridge.JevRequestError("timeout")
 
-        store2, _consumer2, guard2, trigger2 = self._make(timeout)
+        store2, _consumer2, guard2, trigger2 = self._make_default(
+            timeout,
+            tool_name="read_file",
+            action_args={"path": "other.txt"},
+            session_id="s",
+            turn_id="t",
+        )
         self.assertIsNone(guard2.pre_tool_call("read_file", {"path": "other.txt"}, session_id="s", turn_id="t"))
         self.assertIsNone(bridge._active_scope_control(store2, trigger2, scope="default"))
         self.assertEqual(store2.default_scopes()[-1]["state"], "fail_open")
@@ -313,7 +403,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
                 "reason": "the action may be outside the frozen request",
             }
 
-        store, _consumer, guard, trigger = self._make(low_confidence)
+        store, _consumer, guard, trigger = self._make_default(
+            low_confidence,
+            tool_name="write_file",
+            action_args={"path": "readback.txt", "content": "bounded"},
+            session_id="low-session",
+            turn_id="low-turn",
+        )
         result = guard.pre_tool_call(
             "write_file",
             {"path": "readback.txt", "content": "bounded"},
@@ -338,7 +434,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
                 "reason": "the action is likely outside the frozen request",
             }
 
-        store, _consumer, guard, trigger = self._make(threshold_confidence)
+        store, _consumer, guard, trigger = self._make_default(
+            threshold_confidence,
+            tool_name="write_file",
+            action_args={"path": "threshold.txt", "content": "bounded"},
+            session_id="threshold-session",
+            turn_id="threshold-turn",
+        )
         result = guard.pre_tool_call(
             "write_file",
             {"path": "threshold.txt", "content": "bounded"},
@@ -361,7 +463,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
                 "reason": "the action may be outside the frozen request",
             }
 
-        store, _consumer, guard, trigger = self._make(invalid_confidence)
+        store, _consumer, guard, trigger = self._make_default(
+            invalid_confidence,
+            tool_name="write_file",
+            action_args={"path": "invalid.txt", "content": "bounded"},
+            session_id="invalid-session",
+            turn_id="invalid-turn",
+        )
         result = guard.pre_tool_call(
             "write_file",
             {"path": "invalid.txt", "content": "bounded"},
@@ -382,7 +490,13 @@ class DefaultScopeGuardTests(unittest.TestCase):
                 "reason": "the action may be outside the frozen request",
             }
 
-        store, _consumer, guard, trigger = self._make(unknown_confidence)
+        store, _consumer, guard, trigger = self._make_default(
+            unknown_confidence,
+            tool_name="read_file",
+            action_args={"path": "readback.txt"},
+            session_id="unknown-session",
+            turn_id="unknown-turn",
+        )
         result = guard.pre_tool_call(
             "read_file",
             {"path": "readback.txt"},
