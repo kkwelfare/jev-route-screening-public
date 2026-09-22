@@ -18,6 +18,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from .point_state import (
+    POINT_STATE_CONTRACT_VERSION,
+    ControlEffect,
+    PointDecision,
+    PointIdentity,
+    PointStatePolicy,
+    build_point_state_request,
+    parse_point_state_response,
+)
+
 log = logging.getLogger(__name__)
 
 # Schema v1 remains readable for the already-installed synthetic pilot. New
@@ -99,6 +109,7 @@ DEFAULT_SCOPE_CONFIDENCE_THRESHOLD = 0.8
 DEFAULT_SCOPE_UNKNOWN_CONFIDENCE = "不明"
 WORKER_BINDING_SCHEMA_VERSION = 1
 WORKER_BINDING_KIND = "worker_binding"
+POINT_STATE_ENABLED_CONFIG = "point_state_enabled"
 
 
 class BridgeValidationError(ValueError):
@@ -498,6 +509,9 @@ def _legacy_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) ->
     target = raw.get("target_session_key")
     if target is not None:
         event["target_session_key"] = _safe_text(target, "target_session_key", 300)
+    named_milestone = raw.get("next_named_milestone")
+    if named_milestone is not None:
+        event["next_named_milestone"] = _safe_text(named_milestone, "next_named_milestone", 160)
     event["event_key"] = f"{event_task}:{run_id}:{checkpoint_id}"
     if len(_json(event).encode("utf-8")) > MAX_EVENT_BYTES:
         raise BridgeValidationError("checkpoint projection exceeds 16000 UTF-8 bytes")
@@ -569,6 +583,9 @@ def _real_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -> d
     target = raw.get("target_session_key")
     if target is not None:
         event["target_session_key"] = _safe_text(target, "target_session_key", 300)
+    named_milestone = raw.get("next_named_milestone")
+    if named_milestone is not None:
+        event["next_named_milestone"] = _safe_text(named_milestone, "next_named_milestone", 160)
     event["event_key"] = f"{event_task}:{run_id}:{checkpoint_id}"
     if len(_json(event).encode("utf-8")) > MAX_EVENT_BYTES:
         raise BridgeValidationError("checkpoint projection exceeds 16000 UTF-8 bytes")
@@ -583,7 +600,7 @@ def validate_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -
         "schema_version", "synthetic", "sensitive", "projection_safe", "projection_version", "source",
         "category", "profile", "task_id", "run_id", "checkpoint_id", "criteria", "completion_conditions",
         "observation", "recent_steps", "evidence_refs", "completed_tools", "tools_since_previous",
-        "changed_evidence", "changed_evidence_age_seconds", "target_session_key", "original_request",
+        "changed_evidence", "changed_evidence_age_seconds", "target_session_key", "next_named_milestone", "original_request",
         "current_unknown", "next_action", "evidence_fingerprint",
     }
     unknown = sorted(set(raw) - allowed)
@@ -997,11 +1014,78 @@ class Producer:
                 self._diagnostic("checkpoint_persist_failed", contract, detail=str(exc) or type(exc).__name__)
 
 
-def build_jev_request(event: Mapping[str, Any], *, model: str = MODEL) -> dict[str, Any]:
+def _point_state_milestone(event: Mapping[str, Any]) -> str:
+    """Return the stable named contract milestone used by point-state budgets.
+
+    Checkpoint ids identify delivery events, not policy scope.  If the host does
+    not provide a named milestone yet, all current-task events intentionally
+    share one bounded scope instead of resetting correction/refresh budgets.
+    """
+    for key in ("next_named_milestone", "named_milestone", "milestone"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return _safe_text(value, "point-state milestone", 160)
+    return "current-task"
+
+
+def _point_snapshot_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one bounded event into the opt-in point-state contract."""
+    steps = event.get("recent_steps")
+    latest = steps[-1] if isinstance(steps, list) and steps else None
+    return {
+        "goal": event.get("original_request", ""),
+        "scope": event.get("criteria", []),
+        "next_named_milestone": _point_state_milestone(event),
+        "expected_next_action": event.get("next_action", ""),
+        "latest_bounded_input": latest,
+        "latest_bounded_result": event.get("observation", ""),
+        "refs": event.get("evidence_refs", []),
+        "next_named_verification": event.get("next_named_verification"),
+        "correction_instruction": event.get("correction_instruction"),
+    }
+
+
+def _point_snapshot_from_request(request_body: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the existing default-scope projection without retaining tool args."""
+    state_value = request_body.get("state")
+    try:
+        state = json.loads(state_value) if isinstance(state_value, str) else {}
+    except (TypeError, ValueError):
+        state = {}
+    if not isinstance(state, Mapping):
+        state = {}
+    if "goal" in state or "scope" in state:
+        return {
+            "goal": state.get("goal", ""),
+            "scope": state.get("scope", []),
+            "next_named_milestone": state.get("next_named_milestone", ""),
+            "expected_next_action": state.get("expected_next_action", ""),
+            "latest_bounded_input": state.get("latest_bounded_input"),
+            "latest_bounded_result": state.get("latest_bounded_result", ""),
+            "refs": state.get("refs", []),
+            "next_named_verification": state.get("next_named_verification"),
+        }
+    return {
+        "goal": state.get("original_request", ""),
+        "scope": state.get("completion_conditions", []),
+        "next_named_milestone": state.get("checkpoint_id", ""),
+        "expected_next_action": state.get("expected_next_action", ""),
+        "latest_bounded_input": state.get("current_action"),
+        "latest_bounded_result": state.get("remaining_unknowns", ""),
+        "refs": state.get("evidence_refs", []),
+        "next_named_verification": state.get("next_named_verification"),
+    }
+
+
+def build_jev_request(event: Mapping[str, Any], *, model: str = MODEL, point_state_enabled: bool = False) -> dict[str, Any]:
     """Build the bounded structural projection shared by both providers."""
     if not _event_projection_is_eligible(event):
         raise BridgeValidationError("event projection is not eligible")
     model_name = _safe_text(model, "model", 128)
+    if point_state_enabled:
+        request = build_point_state_request(_point_snapshot_from_event(event))
+        request["model"] = model_name
+        return request
     steps = event.get("recent_steps")
     if not isinstance(steps, list) or not steps:
         steps = [{"action": "synthetic_checkpoint", "result": event["observation"], "evidence_changed": False, "evidence_refs": event.get("evidence_refs", [])}]
@@ -1091,6 +1175,23 @@ def parse_jev_response(value: Any, *, transport: str | None = None) -> dict[str,
         raise JevRequestError("malformed_response")
 
 
+def _parse_point_state_for_bridge(value: Any, *, transport: str | None = None) -> dict[str, Any]:
+    """Adapt the frozen point-state parser to the existing provider seam."""
+    decision = parse_point_state_response(value)
+    result: dict[str, Any] = {
+        "label": decision.state or "unknown",
+        "point_state": decision.state,
+        "point_state_accepted": decision.accepted,
+        "point_state_issue": decision.issue,
+        "confidence": decision.confidence,
+        "provider_confidence": decision.provider_confidence,
+        "_point_decision": decision,
+    }
+    if transport is not None:
+        result["transport"] = _safe_text(transport, "transport", 64)
+    return result
+
+
 def _runtime_api_key(env_name: str) -> str:
     """Read only the named runtime environment credential, never its value in errors."""
     if not isinstance(env_name, str) or not env_name.strip() or len(env_name) > 64:
@@ -1166,6 +1267,7 @@ def request_decision_with_fallback(
     fallback: ProviderSpec = FALLBACK_PROVIDER,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     post_fn: Callable[[ProviderSpec, Mapping[str, Any], float], Any] | None = None,
+    parser: Callable[..., dict[str, Any]] = parse_jev_response,
 ) -> dict[str, Any]:
     """Call TypeSafe first and use OpenRouter only for bounded availability failures."""
     if not isinstance(request_body, Mapping):
@@ -1175,7 +1277,7 @@ def request_decision_with_fallback(
     def call(spec: ProviderSpec) -> dict[str, Any]:
         body = dict(request_body)
         body["model"] = spec.model
-        return parse_jev_response(sender(spec, body, timeout), transport=spec.transport)
+        return parser(sender(spec, body, timeout), transport=spec.transport)
 
     try:
         return call(primary)
@@ -1596,6 +1698,11 @@ class DefaultScopeGuard:
         self.consumer: Consumer | None = None
         configured = _config_value(ctx, "default_scope.enabled", True)
         self.enabled = not (isinstance(configured, str) and configured.strip().lower() in {"0", "false", "no", "off"}) and configured is not False
+        # Point-state is a worker-consumer policy.  The established default
+        # scope guard must retain its independent 0.8 legacy route even when a
+        # shared context opts the worker consumer into point-state.
+        self.point_state_enabled = False
+        self.point_state_policy = None
         self._lock = threading.RLock()
         self._contracts: dict[str, dict[str, Any]] = {}
 
@@ -1669,6 +1776,8 @@ class DefaultScopeGuard:
         primary = _configured_provider(self.ctx, "primary", PRIMARY_PROVIDER)
         fallback = _configured_provider(self.ctx, "fallback", FALLBACK_PROVIDER)
         timeout = _configured_timeout(self.ctx)
+        # Keep the default scope classifier and its 0.8 threshold unchanged.
+        # point_state_enabled is consumed only by Consumer._decision.
         return request_decision_with_fallback(request_body, primary=primary, fallback=fallback, timeout=timeout)
 
     def _latest_triggers(self) -> dict[str, dict[str, Any]]:
@@ -1738,7 +1847,7 @@ class DefaultScopeGuard:
             self._append_scope_locked(record)
             return record, True
 
-    def _append_outcome(self, reservation: Mapping[str, Any], *, state: str, label: str, reason: str = "", confidence: float | None = None, guidance: Mapping[str, Any] | None = None, error_reason: str | None = None) -> dict[str, Any]:
+    def _append_outcome(self, reservation: Mapping[str, Any], *, state: str, label: str, reason: str = "", confidence: float | None = None, guidance: Mapping[str, Any] | None = None, error_reason: str | None = None, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         record = dict(reservation)
         confidence_guidance = dict(guidance or _default_scope_confidence_guidance(label, confidence))
         record.update({
@@ -1751,6 +1860,8 @@ class DefaultScopeGuard:
             "error_reason": _safe_text(error_reason, "default scope error", 96, allow_empty=True) if error_reason else None,
             "created_at": _now(),
         })
+        if metadata:
+            record.update(dict(metadata))
         with self.store.interprocess_lock():
             self._append_scope_locked(record)
         return record
@@ -1847,6 +1958,73 @@ class DefaultScopeGuard:
                     ),
                 }
         return {"action": "block", "message": DEFAULT_SCOPE_BLOCK_MESSAGE}
+
+    def _process_point_state_default(
+        self,
+        reservation: Mapping[str, Any],
+        trigger: Mapping[str, Any],
+        action: Mapping[str, Any],
+        request_body: Mapping[str, Any],
+        decision: Mapping[str, Any],
+    ) -> dict[str, str] | None:
+        if self.point_state_policy is None:
+            raise JevRequestError("point_state_disabled")
+        point_decision = Consumer._point_decision_from_mapping(decision)
+        snapshot = _point_snapshot_from_request(request_body)
+        identity = PointIdentity.from_snapshot(
+            str(trigger.get("task_id", "")),
+            str(trigger.get("run_id", "")),
+            str(reservation.get("action_hash", "")),
+            snapshot,
+            contract_version=str(decision.get("contract_version", POINT_STATE_CONTRACT_VERSION)),
+        )
+        effect = self.point_state_policy.evaluate(
+            point_decision,
+            identity,
+            issue="default_scope",
+            milestone=str(trigger.get("checkpoint_id") or "current"),
+            snapshot=snapshot,
+        )
+        state = point_decision.state or "unknown"
+        metadata = {
+            "point_state": state,
+            "point_state_contract_version": identity.contract_version,
+            "point_state_snapshot_hash": identity.snapshot_hash,
+            "point_state_event_id": identity.event_id,
+            "point_state_accepted": point_decision.accepted,
+            "point_state_issue": point_decision.issue,
+            "point_state_action": effect.action,
+            "point_state_reason": effect.reason,
+            "guidance_only": effect.guidance_only,
+            "completion_allowed": effect.completion_allowed,
+        }
+        requires_readback = effect.action == "review" and state in {"scope_or_authorization_blocked", "acceptance_ready"}
+        if requires_readback:
+            self._append_outcome(
+                reservation,
+                state="candidate",
+                label="scope_drift",
+                reason=effect.reason,
+                confidence=point_decision.confidence,
+                guidance=_default_scope_confidence_guidance("scope_drift", point_decision.confidence),
+                metadata=metadata,
+            )
+            if self.consumer is not None:
+                with self.store.interprocess_lock():
+                    if trigger.get("scope") == "default_scope" and not any(row.get("trigger_id") == trigger.get("trigger_id") for row in self.store.triggers()):
+                        self.store.append_trigger(trigger)
+                    self.consumer._append_control_locked(trigger, "provisional_stop", source="default_scope", reason=effect.reason, scope="default")
+            return {"action": "block", "message": _default_scope_advisory_message(action, label="scope_drift", confidence=point_decision.confidence, reason=effect.reason)}
+        self._append_outcome(
+            reservation,
+            state="advisory",
+            label=state,
+            reason=effect.reason,
+            confidence=point_decision.confidence,
+            guidance=_default_scope_confidence_guidance(state, point_decision.confidence),
+            metadata=metadata,
+        )
+        return None
 
     def pre_tool_call(self, tool_name: str = "", args: Any = None, session_id: str = "", turn_id: str = "", **_: Any) -> dict[str, str] | None:
         if not self.enabled or tool_name == "jev_bridge_review":
@@ -2018,13 +2196,16 @@ class Consumer:
         self._review_requested = False
         self._lock = threading.RLock()
         self.scope_guard: DefaultScopeGuard | None = None
+        self.point_state_enabled = _config_bool(ctx, POINT_STATE_ENABLED_CONFIG, False)
+        self.point_state_policy = PointStatePolicy(store_path=store.root / "point-state-ledger.json") if self.point_state_enabled else None
 
     def _decision(self, event: Mapping[str, Any]) -> dict[str, Any]:
         primary = _configured_provider(self.ctx, "primary", PRIMARY_PROVIDER)
         fallback = _configured_provider(self.ctx, "fallback", FALLBACK_PROVIDER)
         timeout = _configured_timeout(self.ctx)
-        request = build_jev_request(event, model=primary.model)
-        return request_decision_with_fallback(request, primary=primary, fallback=fallback, timeout=timeout)
+        request = build_jev_request(event, model=primary.model, point_state_enabled=self.point_state_enabled)
+        parser = _parse_point_state_for_bridge if self.point_state_enabled else parse_jev_response
+        return request_decision_with_fallback(request, primary=primary, fallback=fallback, timeout=timeout, parser=parser)
 
     def _config(self, key: str, default: Any = None) -> Any:
         try:
@@ -2080,7 +2261,15 @@ class Consumer:
         self.store.append_control(record)
         return record
 
-    def _append_trigger(self, event: Mapping[str, Any], decision: Mapping[str, Any], category: str | None) -> dict[str, Any] | None:
+    def _append_trigger(
+        self,
+        event: Mapping[str, Any],
+        decision: Mapping[str, Any],
+        category: str | None,
+        *,
+        point_effect: ControlEffect | None = None,
+        point_identity: PointIdentity | None = None,
+    ) -> dict[str, Any] | None:
         if category is None:
             return None
         dedupe_key = f"{event['task_id']}:{event['run_id']}:{event['checkpoint_id']}:{category}"
@@ -2118,9 +2307,155 @@ class Consumer:
                 "created_at": _now(),
                 "default_decision": "pending_readback",
             }
+            if point_effect is not None:
+                guidance = {
+                    "action": point_effect.action,
+                    "reason": point_effect.reason,
+                    "instructions": list(point_effect.instructions),
+                    "verification_name": point_effect.verification_name,
+                    "guidance_only": point_effect.guidance_only,
+                    "completion_allowed": point_effect.completion_allowed,
+                }
+                record.update({
+                    "point_state": decision.get("point_state"),
+                    "point_state_milestone": decision.get("point_state_milestone"),
+                    "point_state_action": point_effect.action,
+                    "point_state_reason": point_effect.reason,
+                    "point_state_instructions": list(point_effect.instructions),
+                    "point_state_verification_name": point_effect.verification_name,
+                    "point_state_guidance": guidance,
+                    "guidance_only": point_effect.guidance_only,
+                    "completion_allowed": point_effect.completion_allowed,
+                })
+                if point_identity is not None:
+                    record.update({
+                        "point_state_contract_version": point_identity.contract_version,
+                        "point_state_snapshot_hash": point_identity.snapshot_hash,
+                        "point_state_event_id": point_identity.event_id,
+                    })
             self.store.append_trigger(record)
             self._append_control_locked(record, "provisional_stop", source="jev", reason=record["reason"])
             return record
+
+    @staticmethod
+    def _point_decision_from_mapping(decision: Mapping[str, Any]) -> PointDecision:
+        candidate = decision.get("_point_decision")
+        if isinstance(candidate, PointDecision):
+            return candidate
+        response = {
+            "state": decision.get("point_state", decision.get("state", decision.get("label"))),
+            "confidence": decision.get("confidence"),
+        }
+        return parse_point_state_response(response)
+
+    @staticmethod
+    def _point_state_trigger_category(state: str, effect: ControlEffect) -> str | None:
+        """Map every non-continue effect to a visible default review category."""
+        if effect.action == "continue_scoped_action":
+            return None
+        if state == "scope_or_authorization_blocked" or effect.reason == "guard_precedence":
+            return "scope_drift"
+        if state == "acceptance_ready":
+            return "completion_candidate"
+        # Corrections, named verification, bounded refresh, abstentions and
+        # exhausted budgets are guidance/hold cases, never silent completion.
+        return "evidence_mismatch"
+
+    def _process_point_state_event(self, event: Mapping[str, Any], decision: Mapping[str, Any]) -> dict[str, Any]:
+        if self.point_state_policy is None:
+            raise JevRequestError("point_state_disabled")
+        point_decision = self._point_decision_from_mapping(decision)
+        snapshot = _point_snapshot_from_event(event)
+        identity = PointIdentity.from_snapshot(
+            str(event.get("task_id", "")),
+            str(event.get("run_id", "")),
+            str(event.get("event_key") or event.get("checkpoint_id", "")),
+            snapshot,
+            contract_version=str(decision.get("contract_version", POINT_STATE_CONTRACT_VERSION)),
+        )
+        guards = event.get("guards", []) if isinstance(event.get("guards", []), list) else []
+        issue = str(event.get("category") or "point_state")
+        # The checkpoint is the event identity only.  Budgets are scoped to the
+        # stable task/run/issue/named-milestone contract key.
+        milestone = _point_state_milestone(event)
+        effect = self.point_state_policy.evaluate(
+            point_decision,
+            identity,
+            issue=issue,
+            milestone=milestone,
+            snapshot=snapshot,
+            guards=guards,
+        )
+        state = point_decision.state or "unknown"
+        trigger_category = self._point_state_trigger_category(state, effect)
+        trigger = None
+        if trigger_category is not None:
+            trigger_decision = {
+                "label": trigger_category,
+                "route_label": state,
+                "confidence": point_decision.confidence if point_decision.confidence is not None else 0.0,
+                "reason": effect.reason,
+                "point_state": state,
+                "point_state_milestone": milestone,
+            }
+            trigger = self._append_trigger(
+                event,
+                trigger_decision,
+                trigger_category,
+                point_effect=effect,
+                point_identity=identity,
+            )
+            # A prior point-state hold for this task/run is the visible review
+            # destination for later events; do not create a second stop.
+            if trigger is None:
+                for row in reversed(self.store.triggers()):
+                    if (
+                        row.get("task_id") == event.get("task_id")
+                        and str(row.get("run_id")) == str(event.get("run_id"))
+                        and row.get("state") == "pending_review"
+                    ):
+                        trigger = row
+                        break
+        review_state = "triggered" if trigger is not None else "completed"
+        guidance = {
+            "action": effect.action,
+            "reason": effect.reason,
+            "instructions": list(effect.instructions),
+            "verification_name": effect.verification_name,
+            "guidance_only": effect.guidance_only,
+            "completion_allowed": effect.completion_allowed,
+        }
+        self.store.append_review({
+            "event_key": event["event_key"],
+            "state": review_state,
+            "label": state,
+            "point_state": state,
+            "point_state_contract_version": identity.contract_version,
+            "point_state_snapshot_hash": identity.snapshot_hash,
+            "point_state_event_id": identity.event_id,
+            "point_state_milestone": milestone,
+            "point_state_accepted": point_decision.accepted,
+            "point_state_issue": point_decision.issue,
+            "point_state_confidence": point_decision.confidence,
+            "point_state_action": effect.action,
+            "point_state_reason": effect.reason,
+            "point_state_guidance": guidance,
+            "guidance_only": effect.guidance_only,
+            "completion_allowed": effect.completion_allowed,
+            "trigger_id": trigger.get("trigger_id") if trigger else None,
+            "timestamp": _now(),
+        })
+        self.store.append_ledger({
+            "event_key": event["event_key"],
+            "run_key": f"{event['task_id']}:{event['run_id']}",
+            "state": review_state,
+            "point_state_action": effect.action,
+            "reserved_cost_usd": str(RESERVATION_USD),
+            "request_counted": True,
+            "jst_day": _jst_day(),
+            "timestamp": _now(),
+        })
+        return {"decision": decision, "effect": effect, "trigger": trigger}
 
     def process_pending(self) -> bool:
         prior_reviews = self.store.reviews()
@@ -2132,6 +2467,9 @@ class Consumer:
                     return False
             try:
                 decision = dict(self.decision_fn(event))
+                if self.point_state_enabled:
+                    self._process_point_state_event(event, decision)
+                    return True
                 if decision.get("label") not in LABELS or not isinstance(decision.get("confidence"), (int, float)):
                     raise JevRequestError("malformed_response")
                 category = _trigger_category(event, decision, prior_reviews)
@@ -2312,6 +2650,13 @@ def _config_value(ctx: Any, key: str, default: Any = None) -> Any:
         return ctx.get_config(key, default)
     except Exception:
         return default
+
+
+def _config_bool(ctx: Any, key: str, default: bool = False) -> bool:
+    value = _config_value(ctx, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return value is not False and value is not None
 
 
 def _profile_list(value: Any) -> set[str]:

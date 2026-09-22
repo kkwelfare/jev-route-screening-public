@@ -19,6 +19,10 @@ Local runtime records are bounded and metadata-redacted: the bridge avoids persi
 
 The default scope guard is a separate safety path. A high-confidence `scope_drift` result at or above the configured `0.8` threshold can create a provisional default stop and require a matching default readback. Low-confidence or unknown-confidence results, malformed responses, timeouts, and other advisory failures remain fail-open so the original host flow is preserved. The required `pre_tool_call` scope-guard hook is therefore intentional and must not be removed to make the transform seam test pass.
 
+## Opt-in point-state route
+
+The worker `Consumer` can locally classify a bounded point when `settings.point_state_enabled` is explicitly enabled; the default is `false`. `ordinary_action_ready` permits only the existing scoped continuation path, while other classifications become bounded hold/guidance and return to default review. The established default scope classifier and its legacy `0.8` threshold remain separate and unchanged. The new point-state acceptance threshold is `0.60` and remains provisional/uncalibrated. This repository adds no automatic command executor or completion authority, and it does not claim live worker-to-default end-to-end verification.
+
 ## Installation and configuration
 
 Install this directory under the active Hermes home plugin root as `plugins/jev-route-screening/`, then enable it through the host plugin configuration. Do not install a second gateway or copy credentials into this repository. A consumer configuration can be represented as:
