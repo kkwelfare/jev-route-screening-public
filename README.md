@@ -23,6 +23,14 @@ The default scope guard is a separate safety path. A high-confidence `scope_drif
 
 The worker `Consumer` can locally classify a bounded point when `settings.point_state_enabled` is explicitly enabled; the default is `false`. `ordinary_action_ready` permits only the existing scoped continuation path, while other classifications become bounded hold/guidance and return to default review. The established default scope classifier and its legacy `0.8` threshold remain separate and unchanged. The new point-state acceptance threshold is `0.60` and remains provisional/uncalibrated. This repository adds no automatic command executor or completion authority, and it does not claim live worker-to-default end-to-end verification.
 
+## Stopped-worker self-reporting
+
+An active worker provisional stop still blocks ordinary tools, shell/terminal calls, completion, review requests, and other task mutations. The only reporting exception is the native `kanban_block` tool for the current trusted worker task/run/profile and board. Omitting `task_id` uses the verified current task, matching the native handler's default. Wrong-task/board requests, stale bindings, malformed arguments, and control-read failures remain denied.
+
+This exception does not release the stop, permit work to continue, or bypass the native tool's authorization checks. Default retains the existing evidence-review and stop-release responsibility. The narrow exception requires the compatible Hermes Kanban APIs; unavailable identity verification fails closed for the exception, without changing the ordinary no-stop path.
+
+Offline regression coverage for the registered hook and live-assignment discriminators is available via `python3 test_self_block_report.py`; it uses temporary state and mocked board rows, not a production board mutation.
+
 ## Installation and configuration
 
 Install this directory under the active Hermes home plugin root as `plugins/jev-route-screening/`, then enable it through the host plugin configuration. Do not install a second gateway or copy credentials into this repository. A consumer configuration can be represented as:

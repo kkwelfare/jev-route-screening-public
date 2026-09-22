@@ -817,9 +817,10 @@ def _contract_event_key(task_id: str, run_id: str) -> str:
 class Producer:
     """Create bounded real-worker checkpoints from the normal post-tool hook."""
 
-    def __init__(self, store: BridgeStore, profile_name: str | None = None, *, contract_loader: Callable[[], TaskContract] | None = None, clock: Callable[[], float] | None = None, cadence_seconds: float = CHECKPOINT_CADENCE_SECONDS):
+    def __init__(self, store: BridgeStore, profile_name: str | None = None, *, contract_loader: Callable[[], TaskContract] | None = None, clock: Callable[[], float] | None = None, cadence_seconds: float = CHECKPOINT_CADENCE_SECONDS, bridge_root: str | Path | None = None):
         self.store = store
         self.profile_name = profile_name or os.environ.get("HERMES_PROFILE", "") or "unknown"
+        self.bridge_root = bridge_root
         self.contract_loader = contract_loader or _load_dispatcher_contract
         self.clock = clock or time.time
         self.cadence_seconds = float(cadence_seconds)
@@ -846,6 +847,12 @@ class Producer:
             return {"action": "block", "message": "BLOCKED: Jev control readback failed; no tool execution permitted."}
         if active is None:
             return None
+        if tool_name == "kanban_block":
+            self_binding = _self_block_binding(self.profile_name, self.bridge_root, binding)
+            if self_binding is not None and _kanban_block_args_match(args, self_binding):
+                # Returning None preserves the native tool's schema, task/run,
+                # board, and permission checks; this hook grants no board access.
+                return None
         return {"action": "block", "message": PROVISIONAL_STOP_BLOCK_MESSAGE}
 
     def _diagnostic(self, reason: str, contract: TaskContract | None = None, *, detail: str = "") -> None:
@@ -2176,7 +2183,36 @@ class DefaultScopeGuard:
         return _json(self.record_default_decision(trigger_id, payload.get("decision"), readback) or {"trigger_id": trigger_id, "scope": "default_scope", "state": "already_settled"})
 
 
+def _binding_matches_live_assignment(binding: Mapping[str, Any], profile_name: str) -> bool:
+    """Recheck the observer binding against the trusted running board row."""
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        board = binding["board"]
+        task_id = binding["task_id"]
+        run_id = binding["run_id"]
+        with kbc.connect_closing(board=board) as conn:
+            task = kb.get_task(conn, task_id)
+            run = kb.get_run(conn, int(run_id))
+            latest = kb.latest_run(conn, task_id)
+        if task is None or run is None or latest is None:
+            return False
+        if getattr(run, "task_id", None) != task_id or getattr(run, "status", None) != "running":
+            return False
+        if getattr(task, "status", None) != "running":
+            return False
+        if str(getattr(task, "current_run_id", "")) != run_id or str(getattr(latest, "id", "")) != run_id:
+            return False
+        if getattr(task, "assignee", None) != profile_name:
+            return False
+        run_profile = getattr(run, "profile", None)
+        return not run_profile or run_profile == profile_name
+    except Exception:
+        return False
+
+
 def _worker_binding(profile_name: str) -> tuple[str, str] | None:
+    """Read the original process/profile binding used by the stop guard."""
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     profile = os.environ.get("HERMES_PROFILE", "").strip()
@@ -2186,6 +2222,87 @@ def _worker_binding(profile_name: str) -> tuple[str, str] | None:
         return _safe_text(task_id, "worker task_id", 128), _safe_text(run_id, "worker run_id", 128)
     except BridgeValidationError:
         return None
+
+
+def _trusted_current_board() -> str | None:
+    try:
+        from hermes_cli import kanban_db as kb
+        get_current_board = getattr(kb, "get_current_board", None)
+        if not callable(get_current_board):
+            return None
+        board = get_current_board()
+        if not isinstance(board, str) or not board or board != board.strip() or board != board.lower():
+            return None
+        return board
+    except Exception:
+        return None
+
+
+def _self_block_binding(profile_name: str, bridge_root: str | Path | None, expected: tuple[str, str]) -> dict[str, Any] | None:
+    """Establish a trusted current task/run only for the native self-block path."""
+    task_id, run_id = expected
+    if os.environ.get("HERMES_PROFILE", "").strip() != profile_name or profile_name == "default":
+        return None
+    current_board = _trusted_current_board()
+    if current_board is None:
+        return None
+    try:
+        load_binding = globals().get("_load_current_worker_binding")
+        if callable(load_binding) and bridge_root:
+            binding = load_binding(bridge_root, profile_name)
+            if binding is None:
+                return None
+            if binding.get("task_id") != task_id or binding.get("run_id") != run_id:
+                return None
+            if binding.get("worker_profile") != profile_name:
+                return None
+            if binding.get("dispatcher_profile") not in {"", "default"}:
+                return None
+            if binding.get("assignee") not in {"", profile_name}:
+                return None
+            board = binding.get("board") or current_board
+            if board != current_board:
+                return None
+            candidate = dict(binding)
+            candidate["board"] = board
+            if not _binding_matches_live_assignment(candidate, profile_name):
+                return None
+            return candidate
+        contract = _load_dispatcher_contract()
+        if contract.task_id != task_id or contract.run_id != run_id or contract.profile != profile_name:
+            return None
+        candidate = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "worker_profile": profile_name,
+            "dispatcher_profile": "default",
+            "assignee": profile_name,
+            "board": current_board,
+        }
+        return candidate if _binding_matches_live_assignment(candidate, profile_name) else None
+    except Exception:
+        return None
+
+
+def _kanban_block_args_match(args: Any, binding: Mapping[str, Any]) -> bool:
+    """Validate only the native self-block shape; native handler still runs."""
+    if not isinstance(args, dict) or set(args) - {"task_id", "reason", "kind", "board"}:
+        return False
+    reason = args.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+    kind = args.get("kind")
+    if kind is not None and (not isinstance(kind, str) or kind not in {"dependency", "needs_input", "capability", "transient"}):
+        return False
+    if "task_id" in args and (not isinstance(args["task_id"], str) or not args["task_id"] or args["task_id"] != binding.get("task_id")):
+        return False
+    trusted_board = binding.get("board")
+    current_board = _trusted_current_board()
+    if not isinstance(trusted_board, str) or trusted_board != current_board:
+        return False
+    if "board" in args and (not isinstance(args["board"], str) or args["board"] != trusted_board):
+        return False
+    return True
 
 
 class Consumer:
@@ -2685,7 +2802,7 @@ def register(ctx: Any) -> None:
         role, consumer_profiles = "consumer", {"default"}
     if role == "producer" and profile and profile != "default" and profile in producer_profiles:
         store = BridgeStore(root)
-        producer = Producer(store, profile_name=profile)
+        producer = Producer(store, profile_name=profile, bridge_root=root)
         ctx.register_tool(name="jev_bridge_checkpoint", toolset="jev_route_screening", schema=_schema(), handler=producer.checkpoint_tool, description="Submit an optional bounded worker checkpoint; normal tool hooks also create checkpoints when cadence and evidence thresholds are met.")
         ctx.register_hook("pre_tool_call", producer.pre_tool_call)
         ctx.register_hook("post_tool_call", producer.post_tool_call)
