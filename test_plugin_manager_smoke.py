@@ -148,5 +148,73 @@ def main() -> None:
         )
 
 
+def test_real_registry_stopped_review_recovery():
+    """Exercise the host registration/dispatch seam, never the live bridge store."""
+    import os
+    from unittest.mock import patch
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from tools.registry import registry
+
+    plugin = _load_plugin()
+    bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
+    with tempfile.TemporaryDirectory(prefix="jev-review-registry-") as temporary:
+        root = Path(temporary)
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            manager = PluginManager(scope_key=str(root))
+
+            class Context(PluginContext):
+                @property
+                def profile_name(self):
+                    return "default"
+
+                def get_config(self, key, default=None):
+                    return {
+                        "bridge_dir": str(root / "bridge"), "role": "consumer",
+                        "consumer_profiles": ["default"], "producer_profiles": ["ops"],
+                        "default_scope.enabled": True,
+                    }.get(key, default)
+
+            context = Context(PluginManifest(name="jev-route-screening", source="local", path=str(ROOT)), manager)
+            bridge.register(context)
+            schema = registry.get_definitions({"jev_bridge_review"})[0]["function"]
+            assert schema["description"]
+            assert {"scope", "trigger_id", "decision", "readback"} <= set(schema["parameters"]["properties"])
+            guard = next(h.__self__ for h in manager._hooks["pre_tool_call"] if isinstance(h.__self__, bridge.DefaultScopeGuard))
+            guard.decision_fn = lambda _: {"label": "scope_drift", "confidence": 0.9, "reason": "fixture drift"}
+            session = "fixture-default-session"
+            manager.invoke_hook("pre_llm_call", session_id=session, turn_id="turn-1", user_message="Read configuration only", completion_conditions=["report exact configuration"])
+            blocked = manager.invoke_hook("pre_tool_call", tool_name="write_file", args={"path": str(root / "must-not-write")}, session_id=session, turn_id="turn-1")
+            assert any(row and row.get("action") == "block" for row in blocked)
+            review_allowed = manager.invoke_hook("pre_tool_call", tool_name="jev_bridge_review", args={}, session_id=session, turn_id="turn-2")
+            assert not any(row and row.get("action") == "block" for row in review_allowed)
+
+            def dispatch(payload, caller=session):
+                return json.loads(registry.dispatch("jev_bridge_review", payload, scope=str(root), session_id=caller))
+
+            pending = dispatch({})
+            assert len(pending) == 1
+            row = pending[0]
+            assert dispatch({}, "different-session") == []
+            payload = {"scope": "default_scope", "trigger_id": row["trigger_id"], "decision": "no_intervention", "readback": row["readback_template"]}
+            assert "error" in dispatch(payload, "different-session")
+            invalid = dict(payload, readback=dict(payload["readback"], original_request="wrong request"))
+            assert "error" in dispatch(invalid)
+            assert bridge._active_scope_control(guard.store, row, scope="default") is not None
+            assert dispatch(dict(payload, decision="intervene"))["state"] == "intervention_requested"
+            assert bridge._active_scope_control(guard.store, row, scope="default") is not None
+            # The release must not settle an independent worker stop.
+            with guard.store.interprocess_lock():
+                guard.consumer._append_control_locked(row, "provisional_stop", source="jev", reason="worker fixture", scope="worker")
+            assert dispatch(payload)["state"] == "no_intervention"
+            assert dispatch(payload)["state"] == "already_settled"
+            assert dispatch({}) == []
+            assert bridge._active_scope_control(guard.store, row, scope="default") is None
+            assert bridge._active_scope_control(guard.store, row, scope="worker") is not None
+            guard.decision_fn = lambda _: {"label": "insufficient_information", "confidence": 0.5, "reason": "fixture advisory"}
+            continued = manager.invoke_hook("pre_tool_call", tool_name="read_file", args={"path": str(root / "harmless")}, session_id=session, turn_id="turn-3")
+            assert not any(result and result.get("action") == "block" for result in continued)
+            assert not (root / "must-not-write").exists()
+
+
 if __name__ == "__main__":
     main()

@@ -2206,7 +2206,27 @@ class Consumer:
         """Expose only the durable trigger/readback seam to the default profile."""
         payload = dict(args or {})
         if not payload:
-            pending = [row for row in self._latest_triggers().values() if row.get("state") == "pending_review"]
+            pending = []
+            session_id = kwargs.get("session_id", "")
+            session_identity, _ = _scope_identity(session_id, "")
+            for row in self._latest_triggers().values():
+                if row.get("state") != "pending_review":
+                    continue
+                if row.get("scope") == "default_scope" and self.scope_guard is not None:
+                    if _active_scope_control(self.store, row, scope="default") is None:
+                        continue
+                    binding = self.scope_guard._binding(row["trigger_id"])
+                    if not session_identity or (binding and binding.get("session_hash") != _identity_hash(session_identity)):
+                        continue
+                    row = dict(row)
+                    row["readback_template"] = {
+                        key: row[key] for key in (
+                            "task_id", "run_id", "original_request", "completion_conditions",
+                            "evidence_refs", "worker_conclusion", "next_action",
+                        )
+                    }
+                    row["readback_template"].update({"scope": "default_scope", "session_id": session_id})
+                pending.append(row)
             return _json(pending)
         trigger_id = _safe_text(payload.get("trigger_id"), "trigger_id", 128)
         decision = payload.get("decision")
@@ -2214,6 +2234,12 @@ class Consumer:
         if not isinstance(readback, Mapping):
             raise BridgeValidationError("readback must be an object")
         if self.scope_guard is not None and (payload.get("scope") == "default_scope" or readback.get("scope") == "default_scope"):
+            # Bind model-tool decisions to the host session, not a model-supplied identity.
+            session_id = kwargs.get("session_id")
+            if session_id:
+                if readback.get("session_id") not in (None, "", session_id):
+                    raise BridgeValidationError("default scope readback session identity does not match caller")
+                payload["readback"] = dict(readback, session_id=session_id)
             return self.scope_guard.review_tool(payload)
         updated = self.record_default_decision(trigger_id, decision, readback)
         return _json(updated or {"trigger_id": trigger_id, "state": "already_settled"})
@@ -2324,7 +2350,25 @@ def register(ctx: Any) -> None:
         scope_guard = DefaultScopeGuard(ctx, store, process_pending=consumer.process_pending)
         scope_guard.attach_consumer(consumer)
         consumer.scope_guard = scope_guard
-        ctx.register_tool(name="jev_bridge_review", toolset="jev_route_screening", schema={"type": "object", "properties": {"scope": {"type": "string", "enum": ["worker", "default_scope"]}, "trigger_id": {"type": "string"}, "decision": {"type": "string", "enum": ["intervene", "no_intervention"]}, "readback": {"type": "object"}}, "additionalProperties": False}, handler=consumer.review_tool, description="Read durable Jev intervention triggers and record an explicit default readback decision.")
+        ctx.register_tool(
+            name="jev_bridge_review", toolset="jev_route_screening",
+            schema={
+                "name": "jev_bridge_review",
+                "description": "Inspect pending Jev stops with empty arguments, including same-session default readback templates. After reviewing the evidence, submit an explicit decision with scope, trigger_id and readback; no_intervention releases only the matched stop. This tool remains available during a provisional stop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["worker", "default_scope"]},
+                        "trigger_id": {"type": "string"},
+                        "decision": {"type": "string", "enum": ["intervene", "no_intervention"]},
+                        "readback": {"type": "object", "description": "Reviewed evidence from readback_template; retain task/run, original request, completion conditions and evidence references; provide next_action and worker_conclusion. The host session binds default-scope decisions."},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            handler=consumer.review_tool,
+            description="Inspect Jev stops and record an explicit default readback decision.",
+        )
         ctx.register_hook("pre_llm_call", scope_guard.pre_llm_call)
         ctx.register_hook("pre_tool_call", scope_guard.pre_tool_call)
         ctx.register_hook("post_tool_call", consumer.post_tool_call)
