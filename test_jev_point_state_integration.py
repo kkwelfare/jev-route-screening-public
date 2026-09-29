@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -10,7 +9,11 @@ from unittest.mock import patch
 
 import pytest
 
-from .point_state import POINT_STATES
+try:
+    from .point_state import POINT_STATES
+except ImportError:
+    # Also support pytest's importlib mode from this hyphenated checkout.
+    from point_state import POINT_STATES
 
 
 ROOT = Path(__file__).resolve().parent
@@ -253,118 +256,59 @@ def test_real_plugin_manager_point_state_route_and_legacy_default_branch():
         assert legacy_guard.point_state_enabled is False
 
 
-def test_registered_noncontinue_effect_holds_worker_and_budget_survives_checkpoint_release():
-    """The opt-in route is real registry code; controls remain guidance-only and bounded."""
+def test_registered_input_error_guidance_does_not_hold_and_budget_survives_checkpoint():
+    """Non-acceptance states stay guidance-only while correction budgets persist."""
     plugin = _load_plugin()
     bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
-    with tempfile.TemporaryDirectory(prefix="jev-point-state-hold-registry-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="jev-point-state-guidance-registry-") as temporary:
         root = Path(temporary)
-        default_manager, _ = ContextFactory(
-            plugin,
-            bridge,
-            PluginContext,
-            PluginManifest,
-            PluginManager,
-            root,
-            point_state_enabled=True,
-            profile_name="default",
-            role="consumer",
-            manager_scope=root / "default-manager",
+        manager, _ = ContextFactory(
+            plugin, bridge, PluginContext, PluginManifest, PluginManager,
+            root, point_state_enabled=True,
         ).make()
-        consumer, guard = _consumer_and_guard(default_manager, bridge)
-        producer_manager, _ = ContextFactory(
-            plugin,
-            bridge,
-            PluginContext,
-            PluginManifest,
-            PluginManager,
-            root,
-            point_state_enabled=True,
-            profile_name="ops",
-            role="producer",
-            manager_scope=root / "ops-manager",
-        ).make()
-        producer = next(
-            hook.__self__
-            for hook in producer_manager._hooks["pre_tool_call"]
-            if isinstance(getattr(hook, "__self__", None), bridge.Producer)
-        )
+        consumer, guard = _consumer_and_guard(manager, bridge)
         assert consumer.point_state_enabled is True
         assert guard.point_state_enabled is False
 
-        first_event = _event(bridge, task_id="task-hold", run_id="run-hold", checkpoint_id="checkpoint-1")
+        first_event = _event(bridge, task_id="task-guidance", run_id="run-guidance", checkpoint_id="checkpoint-1")
         consumer.store.append_event(first_event)
         calls = []
         with patch.object(bridge, "_post_provider", side_effect=_point_sender(calls, "input_error_unresolved", 0.8)):
             assert consumer.process_pending() is True
 
-        first_trigger = consumer.store.triggers()[-1]
-        assert first_trigger["drift_category"] == "evidence_mismatch"
-        assert first_trigger["point_state_action"] == "correct_input"
-        assert first_trigger["point_state_reason"] == "first_unrepaired_error"
-        assert first_trigger["point_state_instructions"] == ["read the named verification"]
-        assert first_trigger["point_state_guidance"]["instructions"] == ["read the named verification"]
-        assert first_trigger["point_state_milestone"] == "current-task"
-        assert bridge._active_provisional_stop(consumer.store, "task-hold", "run-hold") is not None
-
-        with patch.dict(
-            os.environ,
-            {"HERMES_PROFILE": "ops", "HERMES_KANBAN_TASK": "task-hold", "HERMES_KANBAN_RUN_ID": "run-hold"},
-            clear=False,
-        ):
-            blocked = producer.pre_tool_call("write_file", {"path": "must-not-run"})
-        assert blocked is not None and blocked["action"] == "block"
-        assert bridge.PROVISIONAL_STOP_BLOCK_MESSAGE in blocked["message"]
-
-        readback = {
-            "scope": "worker",
-            "task_id": first_trigger["task_id"],
-            "run_id": first_trigger["run_id"],
-            "original_request": first_trigger["original_request"],
-            "completion_conditions": first_trigger["completion_conditions"],
-            "evidence_refs": first_trigger["evidence_refs"],
-            "next_action": first_trigger["next_action"],
-            "worker_conclusion": {"status": "unmeasured", "reason": "worker test has no final conclusion"},
-        }
-        released = json.loads(
-            consumer.review_tool(
-                args={
-                    "scope": "worker",
-                    "trigger_id": first_trigger["trigger_id"],
-                    "decision": "no_intervention",
-                    "readback": readback,
-                }
-            )
-        )
-        assert released["state"] == "no_intervention"
-        assert bridge._active_provisional_stop(consumer.store, "task-hold", "run-hold") is None
-        with patch.dict(
-            os.environ,
-            {"HERMES_PROFILE": "ops", "HERMES_KANBAN_TASK": "task-hold", "HERMES_KANBAN_RUN_ID": "run-hold"},
-            clear=False,
-        ):
-            assert producer.pre_tool_call("read_file", {"path": "after-release"}) is None
+        first_review = consumer.store.reviews()[-1]
+        assert first_review["state"] == "completed"
+        assert first_review["point_state_action"] == "correct_input"
+        assert first_review["point_state_reason"] == "first_unrepaired_error"
+        assert first_review["point_state_guidance"]["instructions"] == ["read the named verification"]
+        assert first_review["point_state_milestone"] == "current-task"
+        assert not first_review["completion_allowed"]
+        assert not consumer.store.triggers()
+        assert not consumer.store.controls()
 
         # A new event id/checkpoint is allowed, but the stable current-task
         # correction budget is not reset by that new delivery event.
-        second_event = _event(bridge, task_id="task-hold", run_id="run-hold", checkpoint_id="checkpoint-2")
+        second_event = _event(bridge, task_id="task-guidance", run_id="run-guidance", checkpoint_id="checkpoint-2")
         second_event["observation"] = "bounded readback changed after the first correction"
         second_event["recent_steps"][0]["result"] = "verified=true; changed"
         consumer.store.append_event(second_event)
         with patch.object(bridge, "_post_provider", side_effect=_point_sender(calls, "input_error_unresolved", 0.8)):
             assert consumer.process_pending() is True
-        second_trigger = consumer.store.triggers()[-1]
-        assert second_trigger["checkpoint_id"] == "checkpoint-2"
-        assert second_trigger["point_state_milestone"] == "current-task"
-        assert second_trigger["point_state_action"] == "review"
-        assert second_trigger["point_state_reason"] == "correction_budget_exhausted"
-        assert second_trigger["point_state_instructions"] == []
+        second_review = consumer.store.reviews()[-1]
+        assert second_review["point_state_event_id"] == second_event["event_key"]
+        assert second_review["point_state_milestone"] == "current-task"
+        assert second_review["point_state_action"] == "review"
+        assert second_review["point_state_reason"] == "correction_budget_exhausted"
+        assert second_review["point_state_guidance"]["instructions"] == []
+        assert not second_review["completion_allowed"]
+        assert not consumer.store.triggers()
+        assert not consumer.store.controls()
         assert len(calls) == 2
 
 
-def test_registered_unknown_state_is_visible_review_guidance():
+def test_registered_unknown_state_continues_without_a_hold():
     plugin = _load_plugin()
     bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -388,14 +332,13 @@ def test_registered_unknown_state_is_visible_review_guidance():
         with patch.object(bridge, "_post_provider", side_effect=_point_sender([], "unknown", 0.9)):
             assert consumer.process_pending() is True
         review = consumer.store.reviews()[-1]
-        trigger = consumer.store.triggers()[-1]
-        assert review["point_state_action"] == "refresh_evidence_then_review"
-        assert review["state"] == "triggered"
-        assert trigger["point_state"] == "unknown"
-        assert trigger["point_state_reason"] == "unknown_state"
-        assert trigger["point_state_instructions"] == [
-            "Perform one bounded refresh of the named evidence, then return to default review; do not execute an arbitrary command."
-        ]
+        assert review["point_state_action"] == "continue_scoped_action"
+        assert review["point_state_reason"] == "unknown_state"
+        assert review["state"] == "completed"
+        assert review["trigger_id"] is None
+        assert not consumer.store.triggers()
+        assert not consumer.store.controls()
+        assert not review["completion_allowed"]
 
 
 def test_provider_exception_is_failed_not_false_pass():
@@ -419,3 +362,149 @@ def test_provider_exception_is_failed_not_false_pass():
         assert review.get("reason") == "timeout"
         assert review["state"] != "completed"
         assert not consumer.store.triggers()
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"point_state": "evidence_missing", "confidence": 0.95},
+        {"point_state": "scope_or_authorization_blocked", "confidence": 0.95},
+        {"point_state": "acceptance_ready", "confidence": 0.4},
+        {"point_state": "evidence_missing"},
+        {"point_state": ["not-a-state"], "confidence": 0.95},
+    ],
+)
+def test_missing_or_untrusted_classifier_output_does_not_create_a_hold(decision):
+    plugin = _load_plugin()
+    bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    with tempfile.TemporaryDirectory(prefix="jev-point-state-advisory-") as temporary:
+        root = Path(temporary)
+        manager, _ = ContextFactory(
+            plugin, bridge, PluginContext, PluginManifest, PluginManager,
+            root, point_state_enabled=True,
+        ).make()
+        consumer, _ = _consumer_and_guard(manager, bridge)
+        event = _event(bridge, task_id="task-advisory", run_id="run-advisory")
+        snapshot = bridge._point_snapshot_from_event(event)
+        assert "discovery_context" not in event
+        assert "discovery_context" not in snapshot
+        consumer.store.append_event(event)
+        consumer.decision_fn = lambda _event: dict(decision)
+
+        assert consumer.process_pending() is True
+        review = consumer.store.reviews()[-1]
+        assert review["point_state_action"] == "continue_scoped_action"
+        assert not review["completion_allowed"]
+        assert review["trigger_id"] is None
+        assert not consumer.store.triggers()
+        assert not consumer.store.controls()
+
+
+def test_independent_guard_keeps_precedence_over_classifier_label():
+    plugin = _load_plugin()
+    bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    with tempfile.TemporaryDirectory(prefix="jev-point-state-guard-") as temporary:
+        root = Path(temporary)
+        manager, _ = ContextFactory(
+            plugin, bridge, PluginContext, PluginManifest, PluginManager,
+            root, point_state_enabled=True,
+        ).make()
+        consumer, _ = _consumer_and_guard(manager, bridge)
+        event = _event(bridge, task_id="task-guard", run_id="run-guard")
+        event["guards"] = ["trusted_authorization_guard"]
+        consumer.store.append_event(event)
+        consumer.decision_fn = lambda _event: {
+            "point_state": "scope_or_authorization_blocked",
+            "confidence": 0.99,
+        }
+
+        assert consumer.process_pending() is True
+        review = consumer.store.reviews()[-1]
+        assert review["point_state_action"] == "review"
+        assert review["point_state_reason"] == "guard_precedence"
+        assert not review["completion_allowed"]
+        assert len(consumer.store.triggers()) == 1
+        assert consumer.store.triggers()[0]["drift_category"] == "scope_drift"
+        assert len(consumer.store.controls()) == 1
+        assert consumer.store.controls()[0]["control"] == "provisional_stop"
+
+
+def test_acceptance_ready_requires_bound_default_readback_and_releases_hold():
+    plugin = _load_plugin()
+    bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    with tempfile.TemporaryDirectory(prefix="jev-point-state-acceptance-") as temporary:
+        root = Path(temporary)
+        default_manager, _ = ContextFactory(
+            plugin, bridge, PluginContext, PluginManifest, PluginManager,
+            root, point_state_enabled=True, profile_name="default", role="consumer",
+            manager_scope=root / "default-manager",
+        ).make()
+        consumer, _ = _consumer_and_guard(default_manager, bridge)
+        worker_manager, _ = ContextFactory(
+            plugin, bridge, PluginContext, PluginManifest, PluginManager,
+            root, point_state_enabled=True, profile_name="ops", role="producer",
+            manager_scope=root / "worker-manager",
+        ).make()
+        producer = next(
+            hook.__self__
+            for hook in worker_manager._hooks["pre_tool_call"]
+            if isinstance(getattr(hook, "__self__", None), bridge.Producer)
+        )
+        event = _event(bridge, task_id="task-acceptance", run_id="run-acceptance")
+        consumer.store.append_event(event)
+        consumer.decision_fn = lambda _event: {
+            "point_state": "acceptance_ready",
+            "confidence": 0.95,
+        }
+
+        assert consumer.process_pending() is True
+        trigger = consumer.store.triggers()[0]
+        assert len(consumer.store.triggers()) == 1
+        assert len(consumer.store.controls()) == 1
+        assert trigger["task_id"] == event["task_id"]
+        assert str(trigger["run_id"]) == str(event["run_id"])
+        assert trigger["checkpoint_id"] == event["checkpoint_id"]
+        assert trigger["state"] == "pending_review"
+        assert not trigger["completion_allowed"]
+        assert consumer.store.reviews()[-1]["point_state_action"] == "review"
+        assert not consumer.store.reviews()[-1]["completion_allowed"]
+
+        binding = (event["task_id"], str(event["run_id"]))
+        with patch.object(bridge, "_worker_binding", return_value=binding):
+            blocked = producer.pre_tool_call("read_file", {"path": "after-acceptance"})
+        assert blocked is not None and blocked["action"] == "block"
+
+        readback = {
+            "task_id": event["task_id"],
+            "run_id": event["run_id"],
+            "original_request": event["original_request"],
+            "completion_conditions": event["criteria"],
+            "evidence_refs": event["evidence_refs"],
+            "next_action": event["next_action"],
+            "worker_conclusion": {
+                "status": "unmeasured",
+                "reason": "offline acceptance-ready test has no final worker conclusion",
+            },
+        }
+        with pytest.raises(bridge.BridgeValidationError):
+            consumer.record_default_decision(
+                trigger["trigger_id"], "no_intervention", dict(readback, run_id="wrong-run")
+            )
+        assert consumer.store.triggers()[-1]["state"] == "pending_review"
+        assert consumer.store.controls()[0]["control"] == "provisional_stop"
+        with patch.object(bridge, "_worker_binding", return_value=binding):
+            assert producer.pre_tool_call("read_file", {"path": "still-held"}) is not None
+
+        released = consumer.record_default_decision(trigger["trigger_id"], "no_intervention", readback)
+        assert released is not None
+        assert released["state"] == "no_intervention"
+        assert str(released["run_id"]) == str(event["run_id"])
+        assert consumer.store.controls()[-1]["control"] == "release"
+        with patch.object(bridge, "_worker_binding", return_value=binding):
+            assert producer.pre_tool_call("read_file", {"path": "after-release"}) is None

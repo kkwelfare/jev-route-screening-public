@@ -1,6 +1,6 @@
 # Jev route screening
 
-This repository is a clean, local sharing candidate for the Jev route-screening Hermes plugin. It contains the selected bridge/router implementation, the plugin manifest, and bounded offline tests. It is intentionally experimental: it is not a release and does not configure a remote. The repository is licensed under the MIT License; public publication and production use remain separate decisions.
+This repository contains the public source candidate for the Jev route-screening Hermes plugin. It includes the selected bridge/router implementation, the plugin manifest (version 0.4.1), and bounded offline tests. It is intentionally experimental; this candidate patch creates no tag or release and does not configure an installed Hermes runtime. The repository is licensed under the MIT License; production use remains a separate decision.
 
 ## What it does
 
@@ -21,7 +21,7 @@ The default scope guard is a separate safety path. A high-confidence `scope_drif
 
 ## Opt-in point-state route
 
-The worker `Consumer` can locally classify a bounded point when `settings.point_state_enabled` is explicitly enabled; the default is `false`. `ordinary_action_ready` permits only the existing scoped continuation path, while other classifications become bounded hold/guidance and return to default review. The established default scope classifier and its legacy `0.8` threshold remain separate and unchanged. The new point-state acceptance threshold is `0.60` and remains provisional/uncalibrated. This repository adds no automatic command executor or completion authority, and it does not claim live worker-to-default end-to-end verification.
+The worker `Consumer` can locally classify a bounded point when `settings.point_state_enabled` is explicitly enabled; the default is `false`. `evidence_missing`, a classifier-only `scope_or_authorization_blocked` label, and malformed or low-confidence output do not create a hold; any continuation remains limited to the existing authorized task scope and never accepts completion. Only accepted `acceptance_ready` creates a task/run-bound hold for default-owned readback, while separately supplied trusted guards retain precedence. Other classifications provide bounded guidance or a named verification without granting authority. The established default scope classifier and its legacy `0.8` threshold remain separate and unchanged. The new point-state acceptance threshold is `0.60` and remains provisional/uncalibrated. This repository adds no automatic command executor or completion authority, and it does not claim live worker-to-default end-to-end verification.
 
 ## Stopped-worker self-reporting
 
@@ -91,14 +91,15 @@ The repository is not a standalone Python package and does not vendor Hermes Age
 From the repository root:
 
 ```bash
-python3 -m unittest discover -v -p 'test_*.py'
+(cd .. && python3 -m pytest --import-mode=importlib -q jev-route-screening-public/test_jev_point_state_integration.py jev-route-screening-public/test_point_state.py)
 python3 test_transform_tool_result_delivery.py
 python3 test_plugin_manager_smoke.py
 python3 -m py_compile bridge.py skill_router.py __init__.py test_*.py
+hermes plugins validate --json "$PWD"
 ```
 
-The transform probe covers success, provider exception, timeout/fail-open, fresh plugin discovery, later-turn refresh, same-turn deduplication, and the required default scope-guard registration. The remaining tests cover the default scope guard, provider fallback, targeted-reading router, worker binding, worker-to-consumer proof, and isolated plugin registration.
+The point-state command uses pytest's importlib mode from the parent directory because the repository root contains hyphens. It covers missing evidence, classifier-only scope labels, untrusted results, guard precedence, and acceptance-ready readback/release. Full unittest discovery is not listed: two legacy dynamic-loader tests import `bridge.py` outside its package and fail its relative `point_state` import in this checkout. The transform probe covers success, provider exception, timeout/fail-open, fresh plugin discovery, later-turn refresh, same-turn deduplication, and the required default scope-guard registration. Other regression modules cover the default scope guard, provider fallback, targeted-reading router, worker binding, worker-to-consumer proof, and isolated plugin registration.
 
 ## Experimental status and sharing boundary
 
-This is an experimental local candidate for review. It has no remote and no publication metadata. The repository license is MIT; public release, credential provisioning, provider policy, and production enablement remain separate decisions and are not implied by this repository.
+This remains an experimental source candidate. Version 0.4.1 is the plugin manifest version; this patch creates no tag or release. The repository license is MIT; credential provisioning, provider policy, and production enablement remain separate decisions and are not implied by this repository.

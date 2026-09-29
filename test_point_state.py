@@ -4,15 +4,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .point_state import (
-    CONFIDENCE_THRESHOLD,
-    POINT_STATES,
-    PointIdentity,
-    PointStatePolicy,
-    build_point_state_request,
-    derive_exclusive_state,
-    parse_point_state_response,
-)
+try:
+    from .point_state import (
+        CONFIDENCE_THRESHOLD,
+        POINT_STATES,
+        PointIdentity,
+        PointStatePolicy,
+        build_point_state_request,
+        derive_exclusive_state,
+        parse_point_state_response,
+    )
+except ImportError:
+    # Also support direct test-module loading from this hyphenated checkout.
+    from point_state import (
+        CONFIDENCE_THRESHOLD,
+        POINT_STATES,
+        PointIdentity,
+        PointStatePolicy,
+        build_point_state_request,
+        derive_exclusive_state,
+        parse_point_state_response,
+    )
 
 
 class PointStateContractTests(unittest.TestCase):
@@ -130,17 +142,21 @@ class PointStateContractTests(unittest.TestCase):
         self.assertEqual(second.action, "review")
         self.assertEqual(second.reason, "correction_budget_exhausted")
 
-    def test_refresh_budget_is_not_reset_by_new_event(self):
+    def test_evidence_missing_without_discovery_context_continues_in_scope(self):
         store = {}
-        policy = PointStatePolicy(store=store)
+        policy = PointStatePolicy(store=store, max_refreshes=0)
         decision = parse_point_state_response({"state": "evidence_missing", "confidence": 0.8})
         first_snapshot = {"refs": ["a"]}
         first = policy.evaluate(decision, PointIdentity.from_snapshot("task", "run", "1", first_snapshot), issue="i", milestone="m", snapshot=first_snapshot)
         second_snapshot = {"refs": ["b"]}
         second = policy.evaluate(decision, PointIdentity.from_snapshot("task", "run", "2", second_snapshot), issue="i", milestone="m", snapshot=second_snapshot)
-        self.assertEqual(first.action, "refresh_evidence_then_review")
-        self.assertEqual(second.action, "review")
-        self.assertEqual(second.reason, "refresh_budget_exhausted")
+        self.assertNotIn("discovery_context", first_snapshot)
+        self.assertEqual(first.action, "continue_scoped_action")
+        self.assertEqual(second.action, "continue_scoped_action")
+        self.assertFalse(first.completion_allowed)
+        self.assertFalse(second.completion_allowed)
+        self.assertIn("existing admitted task scope", first.instructions[0])
+        self.assertFalse(store.get("budgets"))
 
     def test_duplicate_action_dedup_is_snapshot_bound(self):
         snapshot = {"expected_next_action": "read"}
@@ -166,24 +182,52 @@ class PointStateContractTests(unittest.TestCase):
 
     def test_guards_always_prevail(self):
         snapshot = {"expected_next_action": "read"}
-        policy = PointStatePolicy(store={})
-        effect = policy.evaluate(
-            parse_point_state_response({"state": "ordinary_action_ready", "confidence": 0.99}),
+        for raw in (
+            {"state": "ordinary_action_ready", "confidence": 0.99},
+            {"state": "scope_or_authorization_blocked", "confidence": 0.99},
+            {"state": "acceptance_ready", "confidence": 0.4},
+        ):
+            with self.subTest(raw=raw):
+                effect = PointStatePolicy(store={}).evaluate(
+                    parse_point_state_response(raw),
+                    PointIdentity.from_snapshot("task", "run", "1", snapshot),
+                    issue="i", milestone="m", snapshot=snapshot,
+                    guards=("trusted_authorization_guard",),
+                )
+                self.assertEqual(effect.action, "review")
+                self.assertEqual(effect.reason, "guard_precedence")
+                self.assertFalse(effect.completion_allowed)
+
+    def test_scope_classifier_alone_is_not_independent_guard_evidence(self):
+        snapshot = {"expected_next_action": "read within admitted scope"}
+        effect = PointStatePolicy(store={}).evaluate(
+            parse_point_state_response({"state": "scope_or_authorization_blocked", "confidence": 0.99}),
             PointIdentity.from_snapshot("task", "run", "1", snapshot),
             issue="i", milestone="m", snapshot=snapshot,
-            guards=("scope_guard",),
         )
-        self.assertEqual(effect.action, "review")
-        self.assertEqual(effect.reason, "guard_precedence")
+        self.assertEqual(effect.action, "continue_scoped_action")
+        self.assertEqual(effect.reason, "scope_signal_only")
+        self.assertFalse(effect.completion_allowed)
 
-    def test_untrusted_state_gets_one_bounded_refresh_then_review(self):
-        policy = PointStatePolicy(store={})
+    def test_untrusted_state_continues_only_within_scope_and_never_accepts(self):
+        store = {}
+        policy = PointStatePolicy(store=store, max_refreshes=0)
         snapshot = {"refs": ["named-evidence"]}
         identity = PointIdentity.from_snapshot("task", "run", "1", snapshot)
-        first = policy.evaluate(parse_point_state_response({"state": "ordinary_action_ready", "confidence": 0.2}), identity, issue="i", milestone="m", snapshot=snapshot)
-        second = policy.evaluate(parse_point_state_response({"state": "ordinary_action_ready", "confidence": 0.2}), PointIdentity.from_snapshot("task", "run", "2", dict(snapshot, latest_bounded_result="x")), issue="i", milestone="m", snapshot=dict(snapshot, latest_bounded_result="x"))
-        self.assertEqual(first.action, "refresh_evidence_then_review")
-        self.assertEqual(second.action, "review")
+        low_confidence = parse_point_state_response({"state": "acceptance_ready", "confidence": 0.2})
+        malformed = parse_point_state_response("not-json")
+        first = policy.evaluate(low_confidence, identity, issue="i", milestone="m", snapshot=snapshot)
+        second_snapshot = dict(snapshot, latest_bounded_result="still within scope")
+        second = policy.evaluate(low_confidence, PointIdentity.from_snapshot("task", "run", "2", second_snapshot), issue="i", milestone="m", snapshot=second_snapshot)
+        third = policy.evaluate(malformed, PointIdentity.from_snapshot("task", "run", "3", snapshot), issue="i", milestone="m", snapshot=snapshot)
+        self.assertEqual(first.action, "continue_scoped_action")
+        self.assertEqual(first.reason, "low_confidence_advisory")
+        self.assertEqual(second.action, "continue_scoped_action")
+        self.assertEqual(third.action, "continue_scoped_action")
+        self.assertFalse(first.completion_allowed)
+        self.assertFalse(second.completion_allowed)
+        self.assertFalse(third.completion_allowed)
+        self.assertFalse(store.get("budgets"))
 
     def test_store_path_round_trip_preserves_dedup(self):
         with tempfile.TemporaryDirectory() as tmp:

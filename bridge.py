@@ -2473,16 +2473,12 @@ class Consumer:
 
     @staticmethod
     def _point_state_trigger_category(state: str, effect: ControlEffect) -> str | None:
-        """Map every non-continue effect to a visible default review category."""
-        if effect.action == "continue_scoped_action":
-            return None
-        if state == "scope_or_authorization_blocked" or effect.reason == "guard_precedence":
+        """Only acceptance readiness or an independent guard creates a hold."""
+        if effect.reason == "guard_precedence":
             return "scope_drift"
-        if state == "acceptance_ready":
+        if state == "acceptance_ready" and effect.action == "review":
             return "completion_candidate"
-        # Corrections, named verification, bounded refresh, abstentions and
-        # exhausted budgets are guidance/hold cases, never silent completion.
-        return "evidence_mismatch"
+        return None
 
     def _process_point_state_event(self, event: Mapping[str, Any], decision: Mapping[str, Any]) -> dict[str, Any]:
         if self.point_state_policy is None:

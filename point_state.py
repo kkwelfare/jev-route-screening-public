@@ -330,18 +330,32 @@ class PointStatePolicy:
             return effect
 
         if not decision.accepted:
-            action = "refresh_evidence_then_review"
-            action_key = identity.action_key(issue, milestone, action)
+            # An uncertain classifier result is not an independently supplied
+            # guard. Continue only within the existing authorized scope; it
+            # cannot create a stop or establish readiness/completion.
+            effect = ControlEffect(
+                "continue_scoped_action",
+                True,
+                "low_confidence_advisory" if decision.issue == "low_confidence" else (decision.issue or "untrusted_point_state_advisory"),
+                identity,
+                instructions=(
+                    "Jev did not provide a trusted state; continue only with an already authorized, in-scope action. Do not infer readiness or completion.",
+                ),
+                completion_allowed=False,
+            )
+            action_key = identity.action_key(issue, milestone, effect.action)
             if action_key in self._store.setdefault("actions", {}):
-                return ControlEffect("deduplicated", False, "duplicate_snapshot_action", identity)
-            budget_key = "/".join((identity.task_id, identity.run_id, issue, milestone, "refresh"))
-            if self._budget(budget_key) >= self.max_refreshes:
-                effect = ControlEffect("review", True, "refresh_budget_exhausted", identity)
-            else:
-                self._consume(budget_key)
-                effect = ControlEffect(action, True, decision.issue or "untrusted_point_state", identity, instructions=("Perform one bounded refresh of the named evidence, then return to default review; do not execute an arbitrary command.",))
+                return ControlEffect(
+                    effect.action,
+                    False,
+                    effect.reason,
+                    identity,
+                    instructions=effect.instructions,
+                    completion_allowed=False,
+                    guidance_only=effect.guidance_only,
+                )
             self._remember_event(stream_key, identity.event_id)
-            self._store.setdefault("actions", {})[action_key] = effect.reason
+            self._store["actions"][action_key] = effect.reason
             self._persist()
             return effect
 
@@ -349,10 +363,21 @@ class PointStatePolicy:
         if state is None:
             return ControlEffect("review", False, "missing_state", identity)
 
-        if state in {"scope_or_authorization_blocked", "acceptance_ready"}:
-            action = "review"
-            reason = "scope_or_authorization_blocked" if state == "scope_or_authorization_blocked" else "default_acceptance_review"
-            effect = ControlEffect(action, True, reason, identity, completion_allowed=False)
+        if state == "acceptance_ready":
+            effect = ControlEffect("review", True, "default_acceptance_review", identity, completion_allowed=False)
+        elif state == "scope_or_authorization_blocked":
+            # A classifier label alone is advisory, not independent proof of a
+            # scope or authorization violation. Trusted guards above prevail.
+            effect = ControlEffect(
+                "continue_scoped_action",
+                True,
+                "scope_signal_only",
+                identity,
+                instructions=(
+                    "Treat Jev's scope label as advisory; continue only within the existing authorized task scope.",
+                ),
+                completion_allowed=False,
+            )
         elif state == "input_error_unresolved":
             action = "correct_input"
             action_key = identity.action_key(issue, milestone, action)
@@ -366,16 +391,16 @@ class PointStatePolicy:
                 instruction = str(snapshot.get("correction_instruction") or snapshot.get("expected_next_action") or "Revalidate the actual bounded input against the current contract, then request default review.")
                 effect = ControlEffect(action, True, "first_unrepaired_error", identity, instructions=(instruction,))
         elif state == "evidence_missing":
-            action = "refresh_evidence_then_review"
-            action_key = identity.action_key(issue, milestone, action)
-            if action_key in self._store.setdefault("actions", {}):
-                return ControlEffect("deduplicated", False, "duplicate_snapshot_action", identity)
-            budget_key = "/".join((identity.task_id, identity.run_id, issue, milestone, "refresh"))
-            if self._budget(budget_key) >= self.max_refreshes:
-                effect = ControlEffect("review", True, "refresh_budget_exhausted", identity)
-            else:
-                self._consume(budget_key)
-                effect = ControlEffect(action, True, "evidence_missing", identity, instructions=("Refresh only the contract-named evidence once, then return to default review.",))
+            effect = ControlEffect(
+                "continue_scoped_action",
+                True,
+                "evidence_missing",
+                identity,
+                instructions=(
+                    "Continue gathering only evidence named by the existing admitted task scope; do not infer completion.",
+                ),
+                completion_allowed=False,
+            )
         elif state == "named_verification_ready":
             verification_name = snapshot.get("next_named_verification") or snapshot.get("named_verification")
             if not isinstance(verification_name, str) or not verification_name.strip():
