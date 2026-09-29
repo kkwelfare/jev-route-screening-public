@@ -1,9 +1,15 @@
 name: jev-route-screening
 version: 0.4.1
 description: Common Jev checkpoint bridge with advisory targeted hermes-agent reading
+config_schema:
+  task_input_staging_enabled:
+    type: bool
+    default: false
+    description: Expose the optional blocked-create Jev input staging tool in the default consumer profile.
 provides_tools:
   - jev_bridge_checkpoint
   - jev_bridge_review
+  - jev_stage_task_input
 provides_hooks:
   - pre_llm_call
   - pre_tool_call

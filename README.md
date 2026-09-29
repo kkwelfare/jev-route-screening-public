@@ -8,6 +8,7 @@ The plugin adds a Jev checkpoint bridge for two bounded paths:
 
 - Worker checkpoints: the producer hook records a projection of worker progress and evidence references without persisting raw tool content.
 - Targeted Hermes reading: the default consumer can request an advisory route for the smallest `hermes-agent` reference bundle and attach that advisory to an exact `skill_view` result.
+- Optional task-input staging: when explicitly enabled for the default consumer, a distinct tool creates a Kanban task blocked, binds `provenance.task_id` to the generated ID, persists and reads back the versioned marker, then unblocks it. This transports input only; Jev remains advisory and the tool does not change normal task creation.
 
 The route labels and reference manifest are local allowlisted values. A Jev response cannot execute a tool, select an arbitrary file, change permissions, mutate skills/configuration, or replace the host's worker/skill authority.
 
@@ -54,13 +55,16 @@ plugins:
           timeout_seconds: 5.0
           max_request_chars: 4000
           max_context_chars: 6000
+        task_input_staging_enabled: false
 ```
+
+Task-input staging is disabled unless explicitly enabled under the default consumer's plugin settings. Set `task_input_staging_enabled: true` to register `jev_stage_task_input`; it is never registered for worker profiles. The tool requires the standard `kanban_create`, `kanban_show`, and `kanban_unblock` tools plus `terminal` for the supported `hermes kanban edit` body update. Failures before verified persistence leave the task blocked; retrying identical arguments reuses Kanban's idempotency key.
 
 For a producer worker profile, use `role: producer` and include that profile in `producer_profiles`; the production code intentionally does not expose the producer bridge as a default consumer tool. `bridge_dir` is required. The path is created with restrictive permissions and should be a local directory, not a shared public location.
 
 The manifest declares the host-facing tools and hooks:
 
-- Tools: `jev_bridge_checkpoint`, `jev_bridge_review`.
+- Tools: `jev_bridge_checkpoint`, `jev_bridge_review`, and the opt-in default-only `jev_stage_task_input`.
 - Hooks: `pre_llm_call`, `pre_tool_call`, `post_tool_call`, `transform_tool_result`, and `on_kanban_worker_spawned`.
 
 ## Provider and data flow
@@ -94,8 +98,10 @@ From the repository root:
 (cd .. && python3 -m pytest --import-mode=importlib -q jev-route-screening-public/test_jev_point_state_integration.py jev-route-screening-public/test_point_state.py)
 python3 test_transform_tool_result_delivery.py
 python3 test_plugin_manager_smoke.py
-python3 -m py_compile bridge.py skill_router.py __init__.py test_*.py
+python3 test_task_input_staging.py
+python3 -m py_compile bridge.py skill_router.py __init__.py task_input_staging.py test_*.py
 hermes plugins validate --json "$PWD"
+hermes plugins doctor --ci "$PWD"
 ```
 
 The point-state command uses pytest's importlib mode from the parent directory because the repository root contains hyphens. It covers missing evidence, classifier-only scope labels, untrusted results, guard precedence, and acceptance-ready readback/release. Full unittest discovery is not listed: two legacy dynamic-loader tests import `bridge.py` outside its package and fail its relative `point_state` import in this checkout. The transform probe covers success, provider exception, timeout/fail-open, fresh plugin discovery, later-turn refresh, same-turn deduplication, and the required default scope-guard registration. Other regression modules cover the default scope guard, provider fallback, targeted-reading router, worker binding, worker-to-consumer proof, and isolated plugin registration.

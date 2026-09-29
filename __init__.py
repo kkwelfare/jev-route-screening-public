@@ -49,13 +49,24 @@ def _record_worker_spawned_binding(ctx, **kwargs):
 
 
 def register(ctx):
-    """Register the existing checkpoint bridge and default reading advisory."""
+    """Register existing behavior and any explicitly enabled default add-on."""
     _bridge.register(ctx)
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _bridge._config_value(ctx, "role", "")
     consumers = _profile_list(_bridge._config_value(ctx, "consumer_profiles", []))
     if not role and profile == "default":
         role, consumers = "consumer", {"default"}
+
+    if (
+        profile == "default"
+        and role == "consumer"
+        and profile in consumers
+        and _bridge._config_value(ctx, "task_input_staging_enabled", False) is True
+    ):
+        from .task_input_staging import register_task_input_staging
+
+        register_task_input_staging(ctx)
+
     if role != "consumer" or profile != "default" or profile not in consumers:
         return
     root = _bridge._config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
