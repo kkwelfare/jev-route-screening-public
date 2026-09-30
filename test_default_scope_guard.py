@@ -102,7 +102,7 @@ class DefaultScopeGuardTests(unittest.TestCase):
             )
         return store, consumer, guard, trigger
 
-    def _make_default(self, decision_fn, *, tool_name: str, action_args: dict[str, Any], session_id: str, turn_id: str):
+    def _make_default(self, decision_fn, *, tool_name: str, action_args: dict[str, Any], session_id: str, turn_id: str, user_message: str = "complete the bounded default readback"):
         temporary = tempfile.TemporaryDirectory(prefix="jev-default-request-")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -115,7 +115,7 @@ class DefaultScopeGuardTests(unittest.TestCase):
         guard.pre_llm_call(
             session_id=session_id,
             turn_id=turn_id,
-            user_message="complete the bounded default readback",
+            user_message=user_message,
             completion_conditions=["read only", "record the exact readback"],
         )
         session_identity, turn_identity = bridge._scope_identity(session_id, turn_id)
@@ -511,6 +511,176 @@ class DefaultScopeGuardTests(unittest.TestCase):
         self.assertEqual(outcome["confidence_display"], bridge.DEFAULT_SCOPE_UNKNOWN_CONFIDENCE)
         self.assertFalse(outcome["confidence_gate"]["confirmation_required"])
         self.assertEqual(outcome["confidence_gate"]["next_action"], "display_unknown_only")
+
+    def test_multiturn_purpose_projection_is_persisted_and_delivered_next_turn(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def classify(request: dict[str, Any]) -> dict[str, Any]:
+            calls.append(request)
+            return {
+                "label": "progressing",
+                "confidence": 0.99,
+                "reason": "route remains advisory",
+                "purpose_assessment": {
+                    "category": "procedure_success_but_outcome_missing",
+                    "confidence": 0.91,
+                },
+            }
+
+        store, _consumer, guard, _trigger = self._make_default(
+            classify,
+            tool_name="web_search",
+            action_args={"query": "current news"},
+            session_id="purpose-session",
+            turn_id="initial-turn",
+            user_message="Find useful, diverse current news across several areas.",
+        )
+        history = [
+            {"role": "user", "content": "Find useful, diverse current news across several areas."},
+            {"role": "assistant", "content": "I will search current publications and compare useful results."},
+        ]
+        for index in range(5):
+            history.extend([
+                {"role": "user", "content": f"Continue the broad news search, update {index}."},
+                {"role": "assistant", "content": f"I will continue collecting useful current items, update {index}."},
+            ])
+        history.extend([
+            {"role": "user", "content": "The local request failed; fix the error so I can continue the news search."},
+            {"role": "tool", "name": "run", "status": "error", "content": "SECRET_TOOL_BODY_MUST_NOT_BE_COPIED"},
+        ])
+        guard.pre_llm_call(
+            session_id="purpose-session",
+            turn_id="repair-turn",
+            user_message=history[-2]["content"],
+            conversation_history=history,
+            completion_conditions=["restrict retrieval to one media source", "use an exact 24-hour window"],
+            current_unknown="whether these restrictions still yield useful coverage",
+        )
+        blocked = guard.pre_tool_call(
+            "web_search",
+            {"query": "current news"},
+            session_id="purpose-session",
+            turn_id="repair-turn",
+        )
+        self.assertIsNone(blocked, "purpose classification is advisory and must not add a stop")
+        request_state = json.loads(calls[0]["state"])
+        purpose_context = request_state["purpose_context"]
+        self.assertIn("Find useful, diverse current news", purpose_context["observed_first_user_goal_not_assumed_active"])
+        self.assertIn("fix the error", purpose_context["current_user_instruction"])
+        self.assertEqual(purpose_context["recent_user_attributed_history"][0]["role"], "user")
+        self.assertEqual(purpose_context["recent_user_attributed_history"][-1]["role"], "tool_observation")
+        self.assertNotIn("SECRET_TOOL_BODY_MUST_NOT_BE_COPIED", calls[0]["state"])
+        self.assertIn("authorship/necessity not established", purpose_context["default_derived_requirement_hypotheses"][0]["source"])
+        self.assertIn("explicit user goal change or cancellation", purpose_context["instructions"])
+
+        assessment_row = next(row for row in reversed(store.default_scopes()) if row.get("purpose_assessment"))
+        self.assertEqual(assessment_row["purpose_assessment"]["category"], "procedure_success_but_outcome_missing")
+        self.assertEqual(assessment_row["purpose_assessment"]["confidence"], 0.91)
+        self.assertEqual(assessment_row["purpose_diagnostics"]["provider"], "returned")
+        self.assertFalse(store.controls(), "purpose confidence/category must not create a control")
+
+        delivered = guard.pre_llm_call(
+            session_id="purpose-session",
+            turn_id="next-turn",
+            user_message="Continue searching for the original news outcome.",
+            conversation_history=history,
+        )
+        self.assertIsInstance(delivered, dict)
+        self.assertIn("procedure_success_but_outcome_missing", delivered["context"])
+        self.assertIn("confidence=0.910", delivered["context"])
+        self.assertIn("Default retains final judgment", delivered["context"])
+        delivery_rows = [row for row in store.default_scopes() if row.get("kind") == "default_scope_context_delivery"]
+        self.assertEqual(len(delivery_rows), 1)
+        self.assertEqual(delivery_rows[0]["state"], "purpose_advisory_delivered")
+        self.assertIsNone(guard.pre_llm_call(session_id="purpose-session", turn_id="repeat-turn", user_message="Continue."))
+        self.assertEqual(len([row for row in store.default_scopes() if row.get("kind") == "default_scope_context_delivery"]), 1)
+
+    def test_purpose_parser_is_typed_and_malformed_classification_fails_open(self) -> None:
+        route_probs = {label: (1.0 if label == "progressing" else 0.0) for label in bridge.LABELS}
+        purpose_probs = {label: (1.0 if label == "purpose_critical_prerequisite" else 0.0) for label in bridge.PURPOSE_LABELS}
+        parsed = bridge.parse_jev_response({
+            "answers": {
+                "route": {"choice": "progressing", "probabilities": route_probs, "confidence": 0.9},
+                "purpose": {"choice": "purpose_critical_prerequisite", "probabilities": purpose_probs, "confidence": 0.87},
+            },
+            "model": "local-stub",
+        })
+        self.assertEqual(parsed["purpose_assessment"]["category"], "purpose_critical_prerequisite")
+        self.assertEqual(parsed["purpose_assessment"]["confidence"], 0.87)
+
+        def malformed(_request: dict[str, Any]) -> dict[str, Any]:
+            return {"label": "progressing", "confidence": 0.9, "purpose_assessment": {"category": "invented", "confidence": 0.99}}
+
+        store, _consumer, guard, trigger = self._make_default(
+            malformed,
+            tool_name="read_file",
+            action_args={"path": "fixture.txt"},
+            session_id="malformed-purpose-session",
+            turn_id="malformed-purpose-turn",
+        )
+        self.assertIsNone(guard.pre_tool_call("read_file", {"path": "fixture.txt"}, session_id="malformed-purpose-session", turn_id="malformed-purpose-turn"))
+        self.assertEqual(store.default_scopes()[-1]["state"], "fail_open")
+        self.assertIsNone(bridge._active_scope_control(store, trigger, scope="default"))
+
+    def test_explicit_goal_change_is_kept_distinct_from_prior_goal(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def classify(request: dict[str, Any]) -> dict[str, Any]:
+            calls.append(request)
+            return {"label": "progressing", "confidence": 0.9}
+
+        store, _consumer, guard, _trigger = self._make_default(
+            classify,
+            tool_name="read_file",
+            action_args={"path": "goal.txt"},
+            session_id="goal-change-session",
+            turn_id="goal-1",
+            user_message="Find and summarize useful current news.",
+        )
+        history = [
+            {"role": "user", "content": "Find and summarize useful current news."},
+            {"role": "assistant", "content": "I will gather current items."},
+            {"role": "user", "content": "Cancel the news task. New goal: report the current configuration only."},
+        ]
+        guard.pre_llm_call(
+            session_id="goal-change-session",
+            turn_id="goal-2",
+            user_message=history[-1]["content"],
+            conversation_history=history,
+        )
+        guard.pre_tool_call("read_file", {"path": "config.yaml"}, session_id="goal-change-session", turn_id="goal-2")
+        state = json.loads(calls[0]["state"])
+        purpose = state["purpose_context"]
+        self.assertIn("Find and summarize useful current news", purpose["observed_first_user_goal_not_assumed_active"])
+        self.assertIn("Cancel the news task", purpose["current_user_instruction"])
+        self.assertEqual(purpose["recent_user_attributed_history"][-1]["role"], "user")
+        row = next(row for row in reversed(store.default_scopes()) if row.get("purpose_assessment"))
+        self.assertEqual(row["purpose_assessment"]["category"], "unknown")
+        self.assertIsNone(row["purpose_assessment"]["confidence"])
+
+
+class PurposeWireRegressionTests(unittest.TestCase):
+    def test_all_purpose_categories_preserve_typed_advisory(self) -> None:
+        for category in bridge.PURPOSE_LABELS:
+            with self.subTest(category=category):
+                response = {
+                    "answers": {
+                        "route": {"choice": "progressing", "probabilities": {label: float(label == "progressing") for label in bridge.LABELS}, "confidence": 0.9},
+                        "purpose": {"choice": category, "probabilities": {label: float(label == category) for label in bridge.PURPOSE_LABELS}, "confidence": 0.9},
+                    },
+                    "model": "offline-fixture",
+                }
+                self.assertEqual(bridge.parse_jev_response(response)["purpose_assessment"]["category"], category)
+                for bad in [True, "1.0", float("nan"), float("inf")]:
+                    response["answers"]["purpose"]["probabilities"][category] = bad
+                    with self.assertRaises(bridge.JevRequestError):
+                        bridge.parse_jev_response(response)
+
+    def test_full_history_goal_precedes_bounded_local_repairs(self) -> None:
+        goal = "Find diverse useful news across regions."
+        history = [{"role": "user", "content": goal}] + [{"role": "user", "content": "Fix this local error."} for _ in range(20)]
+        self.assertEqual(bridge._default_scope_first_user_message(history, "Continue"), goal)
+        self.assertLessEqual(len(bridge._default_scope_history(history, "Continue")), bridge.MAX_PURPOSE_HISTORY_MESSAGES)
 
 
 if __name__ == "__main__":

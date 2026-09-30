@@ -52,6 +52,27 @@ CRITERIA = {
     "completion_candidate": "完了条件に必要な証拠がそろっている候補である。",
     "insufficient_information": "識別子、観測、または次の判別材料が不足している。",
 }
+PURPOSE_LABELS = (
+    "purpose_advancing_action",
+    "procedure_success_but_outcome_missing",
+    "error_fix_narrows_discovery",
+    "unsupported_extra_requirement",
+    "purpose_critical_prerequisite",
+    "legitimately_partial_evidence",
+    "unknown",
+)
+PURPOSE_CRITERIA = {
+    "purpose_advancing_action": "The action plausibly advances the active user-requested outcome.",
+    "procedure_success_but_outcome_missing": "A procedure or test may succeed while the requested observable outcome remains unmet.",
+    "error_fix_narrows_discovery": "An error fix or procedure may be narrowing or replacing the original outcome rather than advancing it.",
+    "unsupported_extra_requirement": "A proposed requirement has no established necessity for the user-requested outcome.",
+    "purpose_critical_prerequisite": "The requirement is a plausible goal-critical prerequisite or partial-evidence step.",
+    "legitimately_partial_evidence": "Evidence is legitimately partial and still contributes to the user-requested outcome.",
+    "unknown": "The available user-attributed context is insufficient to distinguish these cases.",
+}
+MAX_PURPOSE_HISTORY_MESSAGES = 8
+MAX_PURPOSE_MESSAGE_CHARS = 320
+MAX_PURPOSE_CONTEXT_CHARS = 1_600
 MAX_EVENT_BYTES = 16_000
 MAX_LIVE_CALLS_PER_RUN = 3
 MAX_CALLS_PER_RUN = 3
@@ -1168,6 +1189,32 @@ def parse_jev_response(value: Any, *, transport: str | None = None) -> dict[str,
             "model": _safe_text(response_model, "response model", 128),
             "usage": _safe_usage(value.get("usage")),
         }
+        purpose = value.get("answers", {}).get("purpose")
+        if purpose is not None:
+            purpose_label = purpose["choice"]
+            purpose_probs = purpose["probabilities"]
+            purpose_confidence = purpose["confidence"]
+            if purpose_label not in PURPOSE_LABELS or not isinstance(purpose_probs, Mapping) or set(purpose_probs) != set(PURPOSE_LABELS):
+                raise ValueError
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in purpose_probs.values()):
+                raise ValueError
+            clean_purpose_probs = {name: float(purpose_probs[name]) for name in PURPOSE_LABELS}
+            if (
+                any(not (0.0 <= v <= 1.0) for v in clean_purpose_probs.values())
+                or isinstance(purpose_confidence, bool)
+                or not isinstance(purpose_confidence, (int, float))
+                or not 0 <= float(purpose_confidence) <= 1
+            ):
+                raise ValueError
+            assessment = {
+                "category": purpose_label,
+                "probabilities": clean_purpose_probs,
+                "confidence": float(purpose_confidence),
+            }
+            purpose_reason = purpose.get("reason")
+            if isinstance(purpose_reason, str) and purpose_reason.strip():
+                assessment["reason"] = _safe_text(purpose_reason, "purpose assessment reason", 240)
+            decision["purpose_assessment"] = assessment
         if transport is not None:
             decision["transport"] = _safe_text(transport, "transport", 64)
         for key in ("route_label", "drift_category", "reason"):
@@ -1537,6 +1584,67 @@ def _default_scope_request_text(value: Any) -> str:
     return ""
 
 
+def _default_scope_history(value: Any, current_user_message: str) -> list[dict[str, str]]:
+    """Keep a small role-attributed history without copying tool-result bodies."""
+    rows: list[dict[str, str]] = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, Mapping):
+                role = item.get("role", item.get("type", "unknown"))
+                role = role.strip().lower() if isinstance(role, str) else "unknown"
+                if role in {"tool", "function"}:
+                    tool_name = item.get("name", item.get("tool_name", "unknown"))
+                    status = item.get("status", "unknown")
+                    safe_name = _safe_text(str(tool_name), "history tool name", 64) if tool_name else "unknown"
+                    safe_status = _safe_text(str(status), "history tool status", 32) if status else "unknown"
+                    text = f"[tool result body omitted; tool={safe_name}; status={safe_status}]"
+                    role = "tool_observation"
+                else:
+                    content = item.get("content", item.get("text"))
+                    text = _default_scope_request_text(content)
+            else:
+                role, text = "unknown", _default_scope_request_text(item)
+            if text:
+                rows.append({"role": role[:32], "content": text[:MAX_PURPOSE_MESSAGE_CHARS]})
+    current = " ".join(current_user_message.split())
+    if current and not any(row["role"] == "user" and row["content"] == current[:MAX_PURPOSE_MESSAGE_CHARS] for row in rows):
+        rows.append({"role": "user", "content": current[:MAX_PURPOSE_MESSAGE_CHARS]})
+    return rows[-MAX_PURPOSE_HISTORY_MESSAGES:]
+
+
+def _default_scope_first_user_message(value: Any, fallback: str) -> str:
+    """Find the first attributable user goal before the bounded recent-history slice."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            role = item.get("role", item.get("type", ""))
+            if not isinstance(role, str) or role.strip().lower() != "user":
+                continue
+            text = _default_scope_request_text(item.get("content", item.get("text")))
+            if text:
+                return text[:300]
+    return fallback[:300] if fallback else "unknown: no user-attributed goal in supplied context"
+
+
+def _default_scope_purpose_assessment(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize an optional purpose classification; absent context stays unknown."""
+    raw = decision.get("purpose_assessment")
+    if raw is None:
+        return {"category": "unknown", "confidence": None, "reason": "purpose assessment unavailable"}
+    if not isinstance(raw, Mapping):
+        raise JevRequestError("malformed_response")
+    category = raw.get("category", raw.get("choice"))
+    if category not in PURPOSE_LABELS:
+        raise JevRequestError("malformed_response")
+    confidence = _default_scope_confidence(raw.get("confidence"))
+    assessment = {"category": category, "confidence": confidence}
+    reason = raw.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        assessment["reason"] = _safe_text(reason, "purpose assessment reason", 240)
+    return assessment
+
+
 def _default_scope_confidence(value: Any) -> float | None:
     """Normalize a Jev confidence while preserving an explicit unknown value."""
     if value is None:
@@ -1629,6 +1737,53 @@ def build_default_scope_request(
         MAX_TEXT,
     )
     expected_next = _safe_text(trigger.get("next_action"), "default scope next_action", 300)
+    raw_purpose_context = trigger.get("purpose_projection")
+    if isinstance(raw_purpose_context, Mapping):
+        purpose_history = raw_purpose_context.get("recent_user_attributed_history", [])
+        if not isinstance(purpose_history, list):
+            purpose_history = []
+        purpose_history = [
+            {
+                "role": _safe_text(item.get("role"), "purpose history role", 32),
+                "content": _safe_text(item.get("content"), "purpose history content", MAX_PURPOSE_MESSAGE_CHARS),
+            }
+            for item in purpose_history[:MAX_PURPOSE_HISTORY_MESSAGES]
+            if isinstance(item, Mapping) and isinstance(item.get("role"), str) and isinstance(item.get("content"), str)
+        ]
+        purpose_context = {
+            "observed_first_user_goal_not_assumed_active": _safe_text(raw_purpose_context.get("observed_first_user_goal"), "observed first user goal", 300),
+            "current_user_instruction": _safe_text(raw_purpose_context.get("current_user_instruction"), "current user instruction", 300),
+            "recent_user_attributed_history": purpose_history,
+            "user_constraints": [
+                _safe_text(item, "user constraint", 300)
+                for item in raw_purpose_context.get("user_constraints", [])[:4]
+                if isinstance(item, str) and item.strip()
+            ] if isinstance(raw_purpose_context.get("user_constraints", []), list) else [],
+            "user_constraints_source": "user-role messages only; infer only when explicit, otherwise unknown",
+            "default_derived_requirement_hypotheses": [
+                {"text": item, "source": "host completion_conditions; authorship/necessity not established"}
+                for item in clean_conditions
+            ],
+            "current_local_problem": _safe_text(raw_purpose_context.get("current_local_problem", "unknown"), "current local problem", 300),
+            "observed_outcome": _safe_text(raw_purpose_context.get("observed_outcome", "unknown"), "observed outcome", 300),
+            "remaining_unknowns": current_unknown,
+            "instructions": "Use chronology: an explicit user goal change or cancellation supersedes earlier goals; a later error-fix request alone does not. Do not freeze the first session topic, guess missing context, or treat Default-derived requirements as user authority. Purpose labels and confidence are advisory only; Default decides.",
+        }
+    else:
+        purpose_context = {
+            "observed_first_user_goal_not_assumed_active": "unknown",
+            "current_user_instruction": original_request,
+            "recent_user_attributed_history": [],
+            "user_constraints_source": "unknown",
+            "default_derived_requirement_hypotheses": [
+                {"text": item, "source": "host completion_conditions; authorship/necessity not established"}
+                for item in clean_conditions
+            ],
+            "current_local_problem": "unknown",
+            "observed_outcome": "unknown",
+            "remaining_unknowns": current_unknown,
+            "instructions": "Missing goal or context is unknown, not guessed. Purpose labels and confidence are advisory only; Default decides.",
+        }
     clean_action = {
         "tool_name": _safe_text(action.get("tool_name"), "default scope current action", 96),
         "arg_keys": [
@@ -1653,6 +1808,7 @@ def build_default_scope_request(
         "turn_hash": _identity_hash(turn_identity) if turn_identity else "",
         "original_request": original_request,
         "completion_conditions": clean_conditions,
+        "purpose_context": purpose_context,
         "current_action": clean_action,
         "expected_next_action": expected_next,
         "remaining_unknowns": current_unknown,
@@ -1682,7 +1838,12 @@ def build_default_scope_request(
                 "type": "choice",
                 "instructions": "Choose exactly one advisory route label. A scope_drift candidate requests default readback; Jev never executes or changes authority.",
                 "criteria": {label: CRITERIA[label] for label in LABELS},
-            }
+            },
+            "purpose": {
+                "type": "choice",
+                "instructions": "Choose exactly one categorical assessment of whether the current Default action/requirement serves the active user-requested outcome. Compare user-attributed history and observable outcome against Default-derived requirement hypotheses. Include typed confidence using the standard choice response contract. Advisory only: do not request approval, block, or change authority.",
+                "criteria": PURPOSE_CRITERIA,
+            },
         },
     }
 
@@ -1716,6 +1877,53 @@ class DefaultScopeGuard:
     def attach_consumer(self, consumer: "Consumer") -> None:
         self.consumer = consumer
 
+    def _deliver_pending_purpose(self, session_identity: str, turn_identity: str) -> str:
+        session_hash = _identity_hash(session_identity)
+        rows = self.store.default_scopes()
+        delivered = {
+            row.get("assessment_id")
+            for row in rows
+            if row.get("kind") == "default_scope_context_delivery" and row.get("state") == "purpose_advisory_delivered"
+        }
+        for row in reversed(rows):
+            if row.get("kind") != DEFAULT_SCOPE_KIND or row.get("session_hash") != session_hash:
+                continue
+            if row.get("state") not in {"advisory", "candidate"}:
+                continue
+            assessment_id = row.get("dedupe_key")
+            raw_assessment = row.get("purpose_assessment")
+            if not isinstance(assessment_id, str) or assessment_id in delivered or not isinstance(raw_assessment, Mapping):
+                continue
+            assessment = _default_scope_purpose_assessment({"purpose_assessment": raw_assessment})
+            category = assessment["category"]
+            confidence = assessment["confidence"]
+            confidence_text = "unknown" if confidence is None else f"{confidence:.3f}"
+            action = row.get("current_action") if isinstance(row.get("current_action"), Mapping) else {}
+            tool_name = action.get("tool_name", "unknown")
+            context = (
+                "Jev purpose advisory (not an instruction, approval, or stop): "
+                f"category={category}; confidence={confidence_text}; current_action={tool_name}. "
+                "Compare with user-attributed goal/history and observed evidence. An explicit user goal change/cancellation supersedes earlier goals; a later error-fix request alone does not. Default retains final judgment."
+            )[:MAX_PURPOSE_CONTEXT_CHARS]
+            delivery = {
+                "schema_version": DEFAULT_SCOPE_SCHEMA_VERSION,
+                "kind": "default_scope_context_delivery",
+                "dedupe_key": "purpose-delivery:" + _identity_hash(assessment_id),
+                "assessment_id": assessment_id,
+                "trigger_id": row.get("trigger_id"),
+                "session_hash": session_hash,
+                "turn_hash": _identity_hash(turn_identity) if turn_identity else "",
+                "state": "purpose_advisory_delivered",
+                "category": category,
+                "confidence": confidence,
+                "context_chars": len(context),
+                "created_at": _now(),
+            }
+            with self.store.interprocess_lock():
+                self._append_scope_locked(delivery)
+            return context
+        return ""
+
     def pre_llm_call(
         self,
         *,
@@ -1725,20 +1933,45 @@ class DefaultScopeGuard:
         completion_conditions: Any = None,
         current_unknown: Any = None,
         evidence_refs: Any = None,
+        conversation_history: Any = None,
+        user_constraints: Any = None,
+        current_problem: Any = None,
+        observed_outcome: Any = None,
         **_: Any,
-    ) -> None:
-        """Freeze the current user scope before the default model acts.
-
-        This is deliberately local state: it is an advisory input to the next
-        tool-call screen, not a replacement for the trusted task/run identity
-        used by the worker consumer.
-        """
+    ) -> dict[str, str] | None:
+        """Capture a bounded, attributed purpose projection and deliver prior advice."""
         if not self.enabled:
             return None
         session_identity, turn_identity = _scope_identity(session_id, turn_id)
-        request = _default_scope_request_text(user_message)
-        if not session_identity or not request:
+        if not session_identity:
             return None
+        delivery_context = self._deliver_pending_purpose(session_identity, turn_identity)
+        request = _default_scope_request_text(user_message)
+        if not request:
+            return {"context": delivery_context} if delivery_context else None
+        previous = self._contract_for(session_identity, turn_identity) or self._contract_for(session_identity, "") or {}
+        previous_projection = previous.get("purpose_projection", {}) if isinstance(previous, Mapping) else {}
+        history = _default_scope_history(conversation_history, request)
+        user_history = [row["content"] for row in history if row.get("role") == "user"]
+        prior_goal = previous_projection.get("observed_first_user_goal") if isinstance(previous_projection, Mapping) else None
+        first_user_goal = prior_goal if isinstance(prior_goal, str) and prior_goal.strip() else _default_scope_first_user_message(conversation_history, request)
+        if not isinstance(first_user_goal, str) or not first_user_goal.strip():
+            first_user_goal = "unknown: no user-attributed goal in the bounded context"
+        if isinstance(user_constraints, str):
+            constraints = [_default_scope_request_text(user_constraints)] if user_constraints.strip() else []
+        elif isinstance(user_constraints, list):
+            constraints = [_default_scope_request_text(item) for item in user_constraints if isinstance(item, str) and item.strip()]
+        else:
+            constraints = user_history[:4]
+        clean_constraints = [item[:300] for item in constraints[:4] if item]
+        projection = {
+            "observed_first_user_goal": first_user_goal[:300],
+            "current_user_instruction": request[:300],
+            "recent_user_attributed_history": history,
+            "user_constraints": clean_constraints,
+            "current_local_problem": _default_scope_request_text(current_problem) or "unknown: host did not expose a structured current problem",
+            "observed_outcome": _default_scope_request_text(observed_outcome) or "unknown: host did not expose a structured observed outcome",
+        }
         conditions = completion_conditions if isinstance(completion_conditions, list) else []
         clean_conditions = [
             _safe_text(item, "default scope completion condition", 300)
@@ -1763,12 +1996,13 @@ class DefaultScopeGuard:
             "completion_conditions": clean_conditions,
             "current_unknown": unknown,
             "evidence_refs": clean_refs,
+            "purpose_projection": projection,
         }
         with self._lock:
             if turn_identity:
                 self._contracts[f"{session_identity}:{turn_identity}"] = contract
             self._contracts[session_identity] = contract
-        return None
+        return {"context": delivery_context} if delivery_context else None
 
     def _contract_for(self, session_identity: str, turn_identity: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1785,6 +2019,8 @@ class DefaultScopeGuard:
         timeout = _configured_timeout(self.ctx)
         # Keep the default scope classifier and its 0.8 threshold unchanged.
         # point_state_enabled is consumed only by Consumer._decision.
+        # Legacy responses remain usable for the independent scope guard.
+        # Missing purpose assessment is unknown, not a new prerequisite.
         return request_decision_with_fallback(request_body, primary=primary, fallback=fallback, timeout=timeout)
 
     def _latest_triggers(self) -> dict[str, dict[str, Any]]:
@@ -1917,6 +2153,7 @@ class DefaultScopeGuard:
             "source_profile": "default",
             "original_request": _safe_text(contract.get("original_request"), "default scope original_request", 300),
             "completion_conditions": list(contract.get("completion_conditions", [])),
+            "purpose_projection": dict(contract.get("purpose_projection", {})) if isinstance(contract.get("purpose_projection"), Mapping) else {},
             "observed_actions": [dict(action)],
             "evidence_refs": list(contract.get("evidence_refs", [])),
             "worker_conclusion": {"status": "unmeasured", "reason": "default scope screen has no worker conclusion"},
@@ -2092,6 +2329,16 @@ class DefaultScopeGuard:
                 model=_config_value(self.ctx, "default_scope_model", MODEL),
             )
             decision = dict(self.decision_fn(request_body))
+            purpose_assessment = _default_scope_purpose_assessment(decision)
+            purpose_metadata = {
+                "purpose_assessment": purpose_assessment,
+                "purpose_diagnostics": {
+                    "hook_capture": "bounded_user_history_captured",
+                    "provider": "returned",
+                    "persistence": "outcome_appended",
+                    "next_context": "pending",
+                },
+            }
             label = decision.get("label")
             if label not in LABELS:
                 raise JevRequestError("malformed_response")
@@ -2099,7 +2346,7 @@ class DefaultScopeGuard:
             reason = decision.get("reason") if isinstance(decision.get("reason"), str) else label
             guidance = _default_scope_confidence_guidance(str(label), confidence)
             if self._candidate(decision) and confidence is not None and confidence >= DEFAULT_SCOPE_CONFIDENCE_THRESHOLD:
-                self._append_outcome(reservation, state="candidate", label="scope_drift", reason=reason, confidence=confidence, guidance=guidance)
+                self._append_outcome(reservation, state="candidate", label="scope_drift", reason=reason, confidence=confidence, guidance=guidance, metadata=purpose_metadata)
                 if self.consumer is not None:
                     with self.store.interprocess_lock():
                         if trigger.get("scope") == "default_scope" and not any(row.get("trigger_id") == trigger.get("trigger_id") for row in self.store.triggers()):
@@ -2110,10 +2357,10 @@ class DefaultScopeGuard:
                 # Low-confidence and unknown-confidence scope drift are advisory
                 # only: do not add a stop or confirmation wait.  The default
                 # profile retains the execution and completion decision.
-                self._append_outcome(reservation, state="advisory", label="scope_drift", reason=reason, confidence=confidence, guidance=guidance)
+                self._append_outcome(reservation, state="advisory", label="scope_drift", reason=reason, confidence=confidence, guidance=guidance, metadata=purpose_metadata)
                 return None
             # insufficient_information and all other labels remain advisory only.
-            self._append_outcome(reservation, state="advisory", label=str(label), reason=reason, confidence=confidence, guidance=guidance)
+            self._append_outcome(reservation, state="advisory", label=str(label), reason=reason, confidence=confidence, guidance=guidance, metadata=purpose_metadata)
             return None
         except Exception as exc:
             self._append_outcome(
@@ -2123,6 +2370,7 @@ class DefaultScopeGuard:
                 reason="default scope Jev failed; original flow preserved",
                 guidance=_default_scope_confidence_guidance("unavailable", None),
                 error_reason=getattr(exc, "reason", type(exc).__name__),
+                metadata={"purpose_diagnostics": {"hook_capture": "bounded_user_history_captured", "provider": "failed_open", "persistence": "outcome_appended", "next_context": "none"}},
             )
             log.info("Jev default scope screen failed open", exc_info=True)
             return None

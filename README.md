@@ -20,6 +20,22 @@ Local runtime records are bounded and metadata-redacted: the bridge avoids persi
 
 The default scope guard is a separate safety path. A high-confidence `scope_drift` result at or above the configured `0.8` threshold can create a provisional default stop and require a matching default readback. Low-confidence or unknown-confidence results, malformed responses, timeouts, and other advisory failures remain fail-open so the original host flow is preserved. The required `pre_tool_call` scope-guard hook is therefore intentional and must not be removed to make the transform seam test pass.
 
+## Default purpose-necessity advisory
+
+The Default guard now supplies a bounded, role-attributed conversation projection alongside the current action. The earlier user goal and the current instruction are separate fields: a later error-repair request must not silently replace the intended outcome. The earlier goal is evidence, not immutable authority; explicit user changes or cancellation take precedence. When the host does not expose a structured problem or observed outcome, those fields remain explicitly unknown.
+
+A second typed `purpose` question asks whether the action advances the requested outcome, merely satisfies a procedure while missing the outcome, narrows discovery to fix an error, adds an unsupported requirement, represents a goal-critical prerequisite, or uses legitimately partial evidence. Insufficient context is `unknown`. Host-supplied completion conditions are requirement hypotheses, not proof that the user imposed or needs them. This assessment shares the existing bounded provider invocation; it adds no separate classifier call.
+
+The classification and confidence are persisted and returned through the next `pre_llm_call` context seam. Purpose confidence never creates a stop, changes permissions, or decides completion: Default must inspect the actual facts and decide whether to continue, change, or drop the requirement. Existing scope-stop/release controls remain unchanged. Delivery is through the supported hook path, not a guarantee for hook-bypassing callers.
+
+Offline purpose regression:
+
+```bash
+python3 -m pytest -q --import-mode=importlib test_default_scope_guard.py test_plugin_manager_smoke.py
+```
+
+Offline fixtures and a native registered-hook probe verify request projection, typed response handling, persistence, and next-model context delivery. They do not establish real-provider classification accuracy or prove that an already-running Gateway loaded changed source; process activation is a separate operator step.
+
 ## Opt-in point-state route
 
 The worker `Consumer` can locally classify a bounded point when `settings.point_state_enabled` is explicitly enabled; the default is `false`. `evidence_missing`, a classifier-only `scope_or_authorization_blocked` label, and malformed or low-confidence output do not create a hold; any continuation remains limited to the existing authorized task scope and never accepts completion. Only accepted `acceptance_ready` creates a task/run-bound hold for default-owned readback, while separately supplied trusted guards retain precedence. Other classifications provide bounded guidance or a named verification without granting authority. The established default scope classifier and its legacy `0.8` threshold remain separate and unchanged. The new point-state acceptance threshold is `0.60` and remains provisional/uncalibrated. This repository adds no automatic command executor or completion authority, and it does not claim live worker-to-default end-to-end verification.
