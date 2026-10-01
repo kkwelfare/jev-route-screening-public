@@ -304,8 +304,10 @@ def _request_with_fallback(
     fallback: bridge.ProviderSpec,
     timeout: float,
     post_fn: Callable[[bridge.ProviderSpec, Mapping[str, Any], float], Any] | None = None,
+    request_id: str | None = None,
 ) -> tuple[dict[str, Any], bridge.ProviderSpec, bool, int]:
     sender = post_fn or bridge._post_provider
+    correlation_id = request_id or bridge._new_lifecycle_id()
     attempts = 0
 
     def call(spec: bridge.ProviderSpec) -> dict[str, Any]:
@@ -313,14 +315,33 @@ def _request_with_fallback(
         attempts += 1
         body = dict(request_body)
         body["model"] = spec.model
-        return _parse_reference_response(sender(spec, body, timeout))
+        bridge._lifecycle_log("provider_start", "jev.skill_reference", correlation_id, provider=spec.name, transport=spec.transport, attempt=attempts)
+        try:
+            raw = sender(spec, body, timeout)
+            bridge._lifecycle_log("transport_response", "jev.skill_reference", correlation_id, provider=spec.name, transport=spec.transport, attempt=attempts, status="returned")
+            decision = _parse_reference_response(raw)
+            bridge._lifecycle_log("validated_response", "jev.skill_reference", correlation_id, provider=spec.name, transport=spec.transport, attempt=attempts, status="valid")
+            return decision
+        except Exception as exc:
+            reason = getattr(exc, "reason", None)
+            failure = reason if isinstance(reason, str) and len(reason) <= 64 else type(exc).__name__
+            bridge._lifecycle_log("provider_failure", "jev.skill_reference", correlation_id, provider=spec.name, transport=spec.transport, attempt=attempts, failure=failure)
+            raise
 
     try:
-        return call(primary), primary, False, attempts
+        decision = call(primary)
+        fallback_used = False
+        provider = primary
     except bridge.JevRequestError as exc:
         if not bridge._fallback_allowed(exc):
+            bridge._lifecycle_log("fallback_skipped", "jev.skill_reference", correlation_id, provider=fallback.name, failure=exc.reason)
             raise
-    return call(fallback), fallback, True, attempts
+        bridge._lifecycle_log("fallback_start", "jev.skill_reference", correlation_id, provider=fallback.name, fallback=True, failure=exc.reason)
+        decision = call(fallback)
+        fallback_used = True
+        provider = fallback
+    bridge._lifecycle_log("result_returned", "jev.skill_reference", correlation_id, destination="targeted-reading-caller", status="validated")
+    return decision, provider, fallback_used, attempts
 
 
 def _request_body(request: str, *, request_id: str, platform: str, model: str) -> dict[str, Any]:
@@ -607,7 +628,7 @@ class TargetedReadingAdvisor:
             fallback = bridge._configured_provider(self.ctx, "fallback", bridge.FALLBACK_PROVIDER)
             body = _request_body(request, request_id=request_id, platform=platform, model=primary.model)
             decision, provider, fallback_used, attempts = _request_with_fallback(
-                body, primary=primary, fallback=fallback, timeout=self.timeout, post_fn=self.post_fn,
+                body, primary=primary, fallback=fallback, timeout=self.timeout, post_fn=self.post_fn, request_id=request_id,
             )
             route = str(decision["route"])
             candidates = _files_for_route(route)
@@ -640,7 +661,10 @@ class TargetedReadingAdvisor:
                 # Keep the result out of all delivery/read-binding state.
                 return None
             self._append(record)
-            return {"context": context} if deliver else None
+            if deliver:
+                bridge._lifecycle_log("delivered", "jev.skill_reference", request_id, destination="pre_llm_context_return", status="supplied")
+                return {"context": context}
+            return None
         except bridge.JevRequestError as exc:
             status = "malformed" if exc.reason == "malformed_response" else "unavailable"
             record = self._result_record(
@@ -800,7 +824,9 @@ class TargetedReadingAdvisor:
             return None
         transformed["jev_advisory"] = self._advisory_field(advisory)
         try:
-            return json.dumps(transformed, ensure_ascii=False)
+            delivered = json.dumps(transformed, ensure_ascii=False)
+            bridge._lifecycle_log("delivered", "jev.skill_reference", str(advisory.get("request_id", "unknown")), destination="post_tool_result_transform", status="supplied")
+            return delivered
         except (TypeError, ValueError):
             return None
 

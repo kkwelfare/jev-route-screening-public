@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -28,7 +29,36 @@ from .point_state import (
     parse_point_state_response,
 )
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("hermes_plugins.jev_lifecycle.bridge")
+log.setLevel(logging.INFO)
+if not any(getattr(handler, "_jev_lifecycle_console", False) for handler in log.handlers):
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    setattr(console, "_jev_lifecycle_console", True)
+    log.addHandler(console)
+
+
+def _lifecycle_log(event: str, route: str, request_id: str, **fields: Any) -> None:
+    """Emit bounded metadata only; logging failures never alter Jev flow."""
+    try:
+        allowed = {"provider", "transport", "attempt", "status", "fallback", "failure", "destination", "classification", "confidence"}
+        safe = {key: value for key, value in fields.items() if key in allowed}
+        clean = lambda value, limit: re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(value))[:limit]
+        for key, value in list(safe.items()):
+            if isinstance(value, str):
+                safe[key] = clean(value, 96)
+        log.info("jev.lifecycle event=%s route=%s request_id=%s metadata=%s", clean(event, 64), clean(route, 96), clean(request_id, 80), json.dumps(safe, sort_keys=True, separators=(",", ":")))
+    except Exception:
+        return
+
+
+def _new_lifecycle_id() -> str:
+    try:
+        import uuid
+        return "jev-" + uuid.uuid4().hex[:20]
+    except Exception:
+        return "jev-unavailable"
 
 # Schema v1 remains readable for the already-installed synthetic pilot. New
 # worker-hook checkpoints use the common v2 worker_checkpoint envelope.
@@ -1322,23 +1352,43 @@ def request_decision_with_fallback(
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     post_fn: Callable[[ProviderSpec, Mapping[str, Any], float], Any] | None = None,
     parser: Callable[..., dict[str, Any]] = parse_jev_response,
+    route: str = "jev.bridge", request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Call TypeSafe first and use OpenRouter only for bounded availability failures."""
+    """Call providers with truthful metadata-only lifecycle events."""
     if not isinstance(request_body, Mapping):
         raise BridgeValidationError("request body must be an object")
     sender = post_fn or _post_provider
+    correlation_id = request_id or _new_lifecycle_id()
+    attempt = 0
 
     def call(spec: ProviderSpec) -> dict[str, Any]:
+        nonlocal attempt
+        attempt += 1
         body = dict(request_body)
         body["model"] = spec.model
-        return parser(sender(spec, body, timeout), transport=spec.transport)
+        _lifecycle_log("provider_start", route, correlation_id, provider=spec.name, transport=spec.transport, attempt=attempt)
+        try:
+            raw = sender(spec, body, timeout)
+            _lifecycle_log("transport_response", route, correlation_id, provider=spec.name, transport=spec.transport, attempt=attempt, status="returned")
+            parsed = parser(raw, transport=spec.transport)
+            _lifecycle_log("validated_response", route, correlation_id, provider=spec.name, transport=spec.transport, attempt=attempt, status="valid")
+            return parsed
+        except Exception as exc:
+            reason = getattr(exc, "reason", None)
+            failure = reason if isinstance(reason, str) and len(reason) <= 64 else type(exc).__name__
+            _lifecycle_log("provider_failure", route, correlation_id, provider=spec.name, transport=spec.transport, attempt=attempt, failure=failure)
+            raise
 
     try:
-        return call(primary)
+        decision = call(primary)
     except JevRequestError as exc:
         if not _fallback_allowed(exc):
+            _lifecycle_log("fallback_skipped", route, correlation_id, provider=fallback.name, failure=exc.reason)
             raise
-    return call(fallback)
+        _lifecycle_log("fallback_start", route, correlation_id, provider=fallback.name, fallback=True, failure=exc.reason)
+        decision = call(fallback)
+    _lifecycle_log("result_returned", route, correlation_id, destination="caller_decision_return", status="validated")
+    return decision
 
 
 def _configured_provider(ctx: Any, prefix: str, default: ProviderSpec) -> ProviderSpec:
@@ -1921,6 +1971,7 @@ class DefaultScopeGuard:
             }
             with self.store.interprocess_lock():
                 self._append_scope_locked(delivery)
+            _lifecycle_log("delivered", "jev.default_scope.purpose+legacy_scope", str(row.get("lifecycle_request_id") or assessment_id), destination="default_pre_llm_context_return", status="supplied", classification=category, confidence=confidence)
             return context
         return ""
 
@@ -2013,7 +2064,7 @@ class DefaultScopeGuard:
             contract = self._contracts.get(session_identity)
             return dict(contract) if contract is not None else None
 
-    def _decision(self, request_body: Mapping[str, Any]) -> dict[str, Any]:
+    def _decision(self, request_body: Mapping[str, Any], request_id: str | None = None) -> dict[str, Any]:
         primary = _configured_provider(self.ctx, "primary", PRIMARY_PROVIDER)
         fallback = _configured_provider(self.ctx, "fallback", FALLBACK_PROVIDER)
         timeout = _configured_timeout(self.ctx)
@@ -2021,7 +2072,7 @@ class DefaultScopeGuard:
         # point_state_enabled is consumed only by Consumer._decision.
         # Legacy responses remain usable for the independent scope guard.
         # Missing purpose assessment is unknown, not a new prerequisite.
-        return request_decision_with_fallback(request_body, primary=primary, fallback=fallback, timeout=timeout)
+        return request_decision_with_fallback(request_body, primary=primary, fallback=fallback, timeout=timeout, route="jev.default_scope.purpose+legacy_scope", request_id=request_id)
 
     def _latest_triggers(self) -> dict[str, dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
@@ -2328,9 +2379,15 @@ class DefaultScopeGuard:
                 turn_identity=turn_identity,
                 model=_config_value(self.ctx, "default_scope_model", MODEL),
             )
-            decision = dict(self.decision_fn(request_body))
+            correlation_id = _new_lifecycle_id()
+            if getattr(self.decision_fn, "__self__", None) is self:
+                decision = dict(self._decision(request_body, request_id=correlation_id))
+            else:
+                decision = dict(self.decision_fn(request_body))
+            _lifecycle_log("decision_received", "jev.default_scope.purpose+legacy_scope", correlation_id, status="returned")
             purpose_assessment = _default_scope_purpose_assessment(decision)
             purpose_metadata = {
+                "lifecycle_request_id": correlation_id,
                 "purpose_assessment": purpose_assessment,
                 "purpose_diagnostics": {
                     "hook_capture": "bounded_user_history_captured",
@@ -2358,9 +2415,11 @@ class DefaultScopeGuard:
                 # only: do not add a stop or confirmation wait.  The default
                 # profile retains the execution and completion decision.
                 self._append_outcome(reservation, state="advisory", label="scope_drift", reason=reason, confidence=confidence, guidance=guidance, metadata=purpose_metadata)
+                _lifecycle_log("assessment_persisted", "jev.default_scope.purpose+legacy_scope", correlation_id, destination="default_scope_store;next_context_pending", status="persisted")
                 return None
             # insufficient_information and all other labels remain advisory only.
             self._append_outcome(reservation, state="advisory", label=str(label), reason=reason, confidence=confidence, guidance=guidance, metadata=purpose_metadata)
+            _lifecycle_log("assessment_persisted", "jev.default_scope.purpose+legacy_scope", correlation_id, destination="default_scope_store;next_context_pending", status="persisted")
             return None
         except Exception as exc:
             self._append_outcome(
@@ -2570,13 +2629,13 @@ class Consumer:
         self.point_state_enabled = _config_bool(ctx, POINT_STATE_ENABLED_CONFIG, False)
         self.point_state_policy = PointStatePolicy(store_path=store.root / "point-state-ledger.json") if self.point_state_enabled else None
 
-    def _decision(self, event: Mapping[str, Any]) -> dict[str, Any]:
+    def _decision(self, event: Mapping[str, Any], request_id: str | None = None) -> dict[str, Any]:
         primary = _configured_provider(self.ctx, "primary", PRIMARY_PROVIDER)
         fallback = _configured_provider(self.ctx, "fallback", FALLBACK_PROVIDER)
         timeout = _configured_timeout(self.ctx)
         request = build_jev_request(event, model=primary.model, point_state_enabled=self.point_state_enabled)
         parser = _parse_point_state_for_bridge if self.point_state_enabled else parse_jev_response
-        return request_decision_with_fallback(request, primary=primary, fallback=fallback, timeout=timeout, parser=parser)
+        return request_decision_with_fallback(request, primary=primary, fallback=fallback, timeout=timeout, parser=parser, route="jev.worker.bridge", request_id=request_id or ("jev-" + hashlib.sha256(str(event.get("event_key", "")).encode()).hexdigest()[:20]))
 
     def _config(self, key: str, default: Any = None) -> Any:
         try:
@@ -2833,9 +2892,14 @@ class Consumer:
                 if not self._reserve(event):
                     return False
             try:
-                decision = dict(self.decision_fn(event))
+                correlation_id = "jev-" + hashlib.sha256(str(event.get("event_key", "")).encode()).hexdigest()[:20]
+                if getattr(self.decision_fn, "__self__", None) is self:
+                    decision = dict(self._decision(event, request_id=correlation_id))
+                else:
+                    decision = dict(self.decision_fn(event))
                 if self.point_state_enabled:
                     self._process_point_state_event(event, decision)
+                    _lifecycle_log("delivered", "jev.worker.bridge", correlation_id, destination="bridge_review_and_ledger_store", status="persisted")
                     return True
                 if decision.get("label") not in LABELS or not isinstance(decision.get("confidence"), (int, float)):
                     raise JevRequestError("malformed_response")
@@ -2856,6 +2920,7 @@ class Consumer:
                     "timestamp": _now(),
                 })
                 self.store.append_ledger({"event_key": event["event_key"], "run_key": f"{event['task_id']}:{event['run_id']}", "state": state, "reserved_cost_usd": str(RESERVATION_USD), "request_counted": True, "jst_day": _jst_day(), "timestamp": _now()})
+                _lifecycle_log("delivered", "jev.worker.bridge", correlation_id, destination="bridge_review_and_ledger_store", status="persisted")
             except Exception as exc:
                 self.store.append_review({"event_key": event["event_key"], "state": "failed", "reason": getattr(exc, "reason", "request_error"), "timestamp": _now()})
                 self.store.append_ledger({"event_key": event["event_key"], "run_key": f"{event['task_id']}:{event['run_id']}", "state": "failed", "reserved_cost_usd": str(RESERVATION_USD), "request_counted": True, "jst_day": _jst_day(), "timestamp": _now()})

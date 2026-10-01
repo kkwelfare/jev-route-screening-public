@@ -2,6 +2,10 @@
 
 This repository contains the public source candidate for the Jev route-screening Hermes plugin. It includes the selected bridge/router implementation, the plugin manifest (version 0.4.1), and bounded offline tests. It is intentionally experimental; this candidate patch creates no tag or release and does not configure an installed Hermes runtime. The repository is licensed under the MIT License; production use remains a separate decision.
 
+## Lifecycle logging
+
+The plugin emits bounded `jev.lifecycle` INFO events to the Gateway component logger for provider attempts, validated results, fallback decisions, and advisory persistence/delivery. Events correlate with a request ID and omit request/response bodies and credentials; logging failures do not change the advisory or fallback behavior.
+
 ## What it does
 
 The plugin adds a Jev checkpoint bridge for two bounded paths:
