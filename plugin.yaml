@@ -10,6 +10,8 @@ provides_tools:
   - jev_bridge_checkpoint
   - jev_bridge_review
   - jev_stage_task_input
+  - request_goal_bind
+  - request_goal_propose_amendment
 provides_hooks:
   - pre_llm_call
   - pre_tool_call

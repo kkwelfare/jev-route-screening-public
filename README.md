@@ -2,6 +2,12 @@
 
 This repository contains the public source candidate for the Jev route-screening Hermes plugin. It includes the selected bridge/router implementation, the plugin manifest (version 0.4.1), and bounded offline tests. It is intentionally experimental; this candidate patch creates no tag or release and does not configure an installed Hermes runtime. The repository is licensed under the MIT License; production use remains a separate decision.
 
+## Request-scoped upper objectives
+
+The default consumer registers `request_goal_bind` and `request_goal_propose_amendment` independently of the optional targeted-reading advisor. A durable request root is selected only from the native host callback when it receives the explicit `new request:` prefix with session, turn, platform, and sender identity. Ordinary messages, repair/retry instructions, and unknown-origin callbacks preserve the selected root; they do not create or amend one. Model tools can read the host-selected root or propose an amendment with current/proposed/reason/impact, but cannot approve it. Approval requires a later exact proposal-specific response from the same host owner/source binding.
+
+A task carries an optional `request_goal_ref_json: {"root_id":"…"}` marker. Producer profiles resolve that ID only in their configured shared bridge store, keep the root distinct from the task-local `outcome_target`, and project both through worker checkpoint and Jev request. Missing or invalid legacy references remain unbound; this does not claim automatic binding for every pre-existing task or every natural-language request. The separate guarded-create wrapper can inherit a host-selected root when its integration is installed and `HERMES_JEV_BRIDGE_DIR` is configured; that wrapper is not bundled here. No authority, stop threshold, or gateway lifecycle is changed, and source edits do not imply activation in an already-running process.
+
 ## Lifecycle logging
 
 The plugin emits bounded `jev.lifecycle` INFO events to the Gateway component logger for provider attempts, validated results, fallback decisions, and advisory persistence/delivery. Events correlate with a request ID and omit request/response bodies and credentials; logging failures do not change the advisory or fallback behavior.

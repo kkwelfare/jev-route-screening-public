@@ -84,6 +84,22 @@ def _bound_method(callback: Any, class_name: str) -> Any:
 
 
 class WorkerConsumerProofTests(unittest.TestCase):
+    def test_explicit_task_root_marker_uses_configured_portable_store(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="portable-goal-transport-") as temporary:
+            root = Path(temporary)
+            from request_goals import RequestGoalStore
+            store = RequestGoalStore(root / "request-goals.jsonl")
+            source_id = store.record_host_source(
+                user_message="new request: keep the original objective",
+                session_id="portable-session", turn_id="portable-turn",
+                sender_id="human", platform="test")
+            record = store.bind(source_id=source_id, root_id="portable-root")
+            body = 'scope_admission_json: {"outcome_target":"repair only","completion_conditions":["test"]}\nrequest_goal_ref_json: {"root_id":"portable-root","store_path":"/ignored"}'
+            ref, outcome = bridge._request_goal_ref(body, root)
+            self.assertEqual(ref, {"root_id": "portable-root"})
+            self.assertEqual(outcome, record["outcome"])
+            self.assertEqual(bridge._request_goal_ref(body, root / "other"), (None, None))
+
     def test_registered_worker_hook_to_consumer_and_default_readback(self) -> None:
         secret_sentinel = "PROOF_SECRET_SENTINEL_MUST_NOT_PERSIST"
         with tempfile.TemporaryDirectory(prefix="jev-worker-consumer-proof-") as temporary:

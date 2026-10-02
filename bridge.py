@@ -632,6 +632,19 @@ def _real_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -> d
         "next_action": next_action,
         "evidence_fingerprint": fingerprint,
     }
+    root_goal = raw.get("root_goal")
+    if root_goal is not None:
+        if not isinstance(root_goal, str) or not root_goal.strip() or len(root_goal.encode("utf-8")) > 8192:
+            raise BridgeValidationError("root_goal exceeds the 8KiB UTF-8 bound")
+        event["root_goal"] = root_goal
+    local_goal = raw.get("local_goal")
+    if local_goal is not None:
+        event["local_goal"] = _safe_text(local_goal, "local_goal", 600)
+    goal_ref = raw.get("request_goal_ref_json")
+    if goal_ref is not None:
+        if not isinstance(goal_ref, Mapping) or not isinstance(goal_ref.get("root_id"), str):
+            raise BridgeValidationError("request_goal_ref_json is invalid")
+        event["request_goal_ref_json"] = {"root_id": _safe_text(goal_ref["root_id"], "root goal id", 128)}
     target = raw.get("target_session_key")
     if target is not None:
         event["target_session_key"] = _safe_text(target, "target_session_key", 300)
@@ -786,6 +799,9 @@ class TaskContract:
     current_unknown: str
     next_action: str
     evidence_refs: tuple[str, ...]
+    root_goal: str | None = None
+    local_goal: str | None = None
+    request_goal_ref_json: Mapping[str, str] | None = None
 
 
 def _extract_scope_admission(body: str) -> Mapping[str, Any]:
@@ -804,7 +820,29 @@ def _extract_scope_admission(body: str) -> Mapping[str, Any]:
     raise TaskContractError("scope_admission_json is not available in task body")
 
 
-def _load_dispatcher_contract() -> TaskContract:
+def _request_goal_ref(body: str, bridge_root: str | Path | None) -> tuple[dict[str, str] | None, str | None]:
+    """Resolve an explicit task marker against the configured goal store only."""
+    if not bridge_root:
+        return None, None
+    marker = "request_goal_ref_json:"
+    index = body.find(marker)
+    if index < 0:
+        return None, None
+    try:
+        ref, _ = json.JSONDecoder().raw_decode(body[index + len(marker):].lstrip())
+        if not isinstance(ref, Mapping) or not isinstance(ref.get("root_id"), str):
+            return None, None
+        from .request_goals import MAX_GOAL_BYTES, RequestGoalStore
+        root = RequestGoalStore(Path(bridge_root).expanduser() / "request-goals.jsonl").get(ref["root_id"])
+        outcome = root.get("outcome")
+        if not isinstance(outcome, str) or not outcome.strip() or len(outcome.encode("utf-8")) > MAX_GOAL_BYTES:
+            return None, None
+        return {"root_id": ref["root_id"]}, outcome
+    except Exception:
+        return None, None
+
+
+def _load_dispatcher_contract(bridge_root: str | Path | None = None) -> TaskContract:
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     profile = os.environ.get("HERMES_PROFILE", "").strip()
@@ -830,6 +868,7 @@ def _load_dispatcher_contract() -> TaskContract:
     if not isinstance(task.body, str) or not task.body.strip():
         raise TaskContractError("task body is missing")
     admission = _extract_scope_admission(task.body)
+    goal_ref, root_goal = _request_goal_ref(task.body, bridge_root)
     values = admission.get("completion_conditions")
     if not isinstance(values, list) or not values:
         raise TaskContractError("scope_admission_json.completion_conditions is missing")
@@ -837,7 +876,8 @@ def _load_dispatcher_contract() -> TaskContract:
     if not criteria:
         raise TaskContractError("completion conditions contain no usable strings")
     original_value = admission.get("outcome_target") or task.title
-    original = _safe_text(original_value, "original request", 300)
+    local_goal = _safe_text(original_value, "local goal", 600)
+    original = root_goal or _safe_text(original_value, "original request", 300)
     decision_points = admission.get("decision_points")
     if isinstance(decision_points, list) and decision_points:
         unknown = "; ".join(str(value) for value in decision_points[:4] if isinstance(value, str) and value.strip())
@@ -859,6 +899,9 @@ def _load_dispatcher_contract() -> TaskContract:
         current_unknown=current_unknown,
         next_action=next_action,
         evidence_refs=(f"kanban://task/{task_id}",),
+        root_goal=root_goal,
+        local_goal=local_goal if root_goal is not None else None,
+        request_goal_ref_json=goal_ref,
     )
 
 
@@ -873,7 +916,7 @@ class Producer:
         self.store = store
         self.profile_name = profile_name or os.environ.get("HERMES_PROFILE", "") or "unknown"
         self.bridge_root = bridge_root
-        self.contract_loader = contract_loader or _load_dispatcher_contract
+        self.contract_loader = contract_loader or (lambda: _load_dispatcher_contract(self.bridge_root))
         self.clock = clock or time.time
         self.cadence_seconds = float(cadence_seconds)
         self._states: dict[str, dict[str, Any]] = {}
@@ -1010,6 +1053,9 @@ class Producer:
             "changed_evidence": bool(state["changed"]),
             "changed_evidence_age_seconds": age,
             "original_request": contract.original_request,
+            "root_goal": contract.root_goal,
+            "local_goal": contract.local_goal,
+            "request_goal_ref_json": contract.request_goal_ref_json,
             "current_unknown": contract.current_unknown,
             "next_action": contract.next_action,
             "evidence_fingerprint": fingerprint,
@@ -1155,6 +1201,9 @@ def build_jev_request(event: Mapping[str, Any], *, model: str = MODEL, point_sta
         "checkpoint_id": event["checkpoint_id"],
         "profile": event.get("profile", "unknown"),
         "original_request": event["original_request"],
+        "root_goal": event.get("root_goal"),
+        "local_goal": event.get("local_goal"),
+        "request_goal_ref_json": event.get("request_goal_ref_json"),
         "completion_conditions": event["criteria"],
         "recent_steps": steps,
         "evidence_change": {
