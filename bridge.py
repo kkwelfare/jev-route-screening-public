@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -1200,15 +1201,22 @@ def _safe_usage(value: Any) -> dict[str, int | float | str] | None:
 
 def parse_jev_response(value: Any, *, transport: str | None = None) -> dict[str, Any]:
     try:
+        def validated_unit_number(candidate: Any) -> float:
+            if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+                raise ValueError
+            number = float(candidate)
+            if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                raise ValueError
+            return number
+
         route = value["answers"]["route"]
         label = route["choice"]
         probs = route["probabilities"]
         confidence = route["confidence"]
         if label not in LABELS or not isinstance(probs, Mapping) or set(probs) != set(LABELS):
             raise ValueError
-        probabilities = {name: float(probs[name]) for name in LABELS}
-        if any(v < 0 or v > 1 for v in probabilities.values()) or not isinstance(confidence, (int, float)) or not 0 <= float(confidence) <= 1:
-            raise ValueError
+        probabilities = {name: validated_unit_number(probs[name]) for name in LABELS}
+        confidence = validated_unit_number(confidence)
         response_model = value.get("model", MODEL)
         if not isinstance(response_model, str) or not response_model.strip():
             raise ValueError
@@ -1226,16 +1234,8 @@ def parse_jev_response(value: Any, *, transport: str | None = None) -> dict[str,
             purpose_confidence = purpose["confidence"]
             if purpose_label not in PURPOSE_LABELS or not isinstance(purpose_probs, Mapping) or set(purpose_probs) != set(PURPOSE_LABELS):
                 raise ValueError
-            if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in purpose_probs.values()):
-                raise ValueError
-            clean_purpose_probs = {name: float(purpose_probs[name]) for name in PURPOSE_LABELS}
-            if (
-                any(not (0.0 <= v <= 1.0) for v in clean_purpose_probs.values())
-                or isinstance(purpose_confidence, bool)
-                or not isinstance(purpose_confidence, (int, float))
-                or not 0 <= float(purpose_confidence) <= 1
-            ):
-                raise ValueError
+            clean_purpose_probs = {name: validated_unit_number(purpose_probs[name]) for name in PURPOSE_LABELS}
+            purpose_confidence = validated_unit_number(purpose_confidence)
             assessment = {
                 "category": purpose_label,
                 "probabilities": clean_purpose_probs,

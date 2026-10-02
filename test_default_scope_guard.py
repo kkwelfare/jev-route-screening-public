@@ -608,6 +608,20 @@ class DefaultScopeGuardTests(unittest.TestCase):
         self.assertEqual(parsed["purpose_assessment"]["category"], "purpose_critical_prerequisite")
         self.assertEqual(parsed["purpose_assessment"]["confidence"], 0.87)
 
+        route_response = {
+            "answers": {"route": {"choice": "progressing", "probabilities": route_probs, "confidence": 0.9}},
+            "model": "local-stub",
+        }
+        for bad_confidence in (True, False):
+            malformed_response = json.loads(json.dumps(route_response))
+            malformed_response["answers"]["route"]["confidence"] = bad_confidence
+            with self.assertRaises(bridge.JevRequestError):
+                bridge.parse_jev_response(malformed_response)
+
+        valid_route = bridge.parse_jev_response(route_response)
+        self.assertEqual(valid_route["confidence"], 0.9)
+        self.assertEqual(valid_route["probabilities"]["progressing"], 1.0)
+
         def malformed(_request: dict[str, Any]) -> dict[str, Any]:
             return {"label": "progressing", "confidence": 0.9, "purpose_assessment": {"category": "invented", "confidence": 0.99}}
 
