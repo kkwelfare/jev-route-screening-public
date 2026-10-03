@@ -91,10 +91,13 @@ def main() -> None:
         scope_guards = _owners(default_context, "DefaultScopeGuard", "pre_tool_call")
         scope_guard_llm_hooks = _owners(default_context, "DefaultScopeGuard", "pre_llm_call")
         advisors = _owners(default_context, "TargetedReadingAdvisor", "pre_llm_call")
+        purpose_advisors = _owners(default_context, "PurposeBackgroundAdvisor", "pre_llm_call")
         if len(consumers) != 1 or len(scope_guards) != 1 or len(scope_guard_llm_hooks) != 1 or len(advisors) != 1:
             raise SystemExit(
                 f"isolated default registration missing consumer/scope/advisor hook: consumers={len(consumers)} scope_guards={len(scope_guards)} scope_guard_llm_hooks={len(scope_guard_llm_hooks)} advisors={len(advisors)}"
             )
+        if len(purpose_advisors) != 1 or len(_owners(default_context, "PurposeBackgroundAdvisor", "post_llm_call")) != 1:
+            raise SystemExit("isolated default registration missing background purpose hooks")
         if "jev_bridge_review" not in default_context.tools or "jev_bridge_checkpoint" in default_context.tools:
             raise SystemExit("isolated default registration exposed the wrong bridge tool")
 

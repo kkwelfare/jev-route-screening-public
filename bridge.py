@@ -1826,6 +1826,15 @@ def build_default_scope_request(
     trigger_id = _safe_text(trigger.get("trigger_id"), "default scope trigger_id", 128)
     checkpoint_id = _safe_text(trigger.get("checkpoint_id"), "default scope checkpoint_id", 128)
     original_request = _safe_text(trigger.get("original_request"), "default scope original_request", 300)
+    root_goal = trigger.get("root_goal")
+    if root_goal is not None:
+        root_goal = _safe_text(root_goal, "default scope root_goal", 300)
+    local_goal = trigger.get("local_goal")
+    if local_goal is not None:
+        local_goal = _safe_text(local_goal, "default scope local_goal", 600)
+    goal_ref = trigger.get("request_goal_ref_json")
+    if goal_ref is not None and (not isinstance(goal_ref, Mapping) or not isinstance(goal_ref.get("root_id"), str)):
+        raise BridgeValidationError("default scope request_goal_ref_json is invalid")
     conditions = trigger.get("completion_conditions")
     if not isinstance(conditions, list) or not conditions or len(conditions) > MAX_CRITERIA:
         raise BridgeValidationError("default scope completion_conditions are invalid")
@@ -1908,6 +1917,10 @@ def build_default_scope_request(
         "original_request": original_request,
         "completion_conditions": clean_conditions,
         "purpose_context": purpose_context,
+        "root_goal": root_goal,
+        "local_goal": local_goal,
+        "request_goal_ref_json": {"root_id": _safe_text(goal_ref["root_id"], "root goal id", 128)} if goal_ref else None,
+        "confirmed_request_goal": root_goal or "unknown: no host-confirmed request root",
         "current_action": clean_action,
         "expected_next_action": expected_next,
         "remaining_unknowns": current_unknown,
@@ -2254,6 +2267,9 @@ class DefaultScopeGuard:
             "original_request": _safe_text(contract.get("original_request"), "default scope original_request", 300),
             "completion_conditions": list(contract.get("completion_conditions", [])),
             "purpose_projection": dict(contract.get("purpose_projection", {})) if isinstance(contract.get("purpose_projection"), Mapping) else {},
+            "root_goal": contract.get("root_goal"),
+            "local_goal": contract.get("local_goal"),
+            "request_goal_ref_json": contract.get("request_goal_ref_json"),
             "observed_actions": [dict(action)],
             "evidence_refs": list(contract.get("evidence_refs", [])),
             "worker_conclusion": {"status": "unmeasured", "reason": "default scope screen has no worker conclusion"},
@@ -3148,11 +3164,11 @@ def _profile_list(value: Any) -> set[str]:
     return set()
 
 
-def register(ctx: Any) -> None:
+def register(ctx: Any) -> DefaultScopeGuard | None:
     root = _config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
     if not root:
         log.warning("jev-route-screening disabled: bridge_dir is not configured")
-        return
+        return None
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _config_value(ctx, "role", "")
     producer_profiles = _profile_list(_config_value(ctx, "producer_profiles", []))
@@ -3198,5 +3214,7 @@ def register(ctx: Any) -> None:
         ctx.register_hook("pre_llm_call", scope_guard.pre_llm_call)
         ctx.register_hook("pre_tool_call", scope_guard.pre_tool_call)
         ctx.register_hook("post_tool_call", consumer.post_tool_call)
+        return scope_guard
     else:
         log.info("jev-route-screening disabled for unconfigured profile=%s role=%s", profile or "unknown", role or "unknown")
+        return None

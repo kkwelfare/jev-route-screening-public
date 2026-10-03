@@ -23,9 +23,38 @@ class RegisteredRouteTests(unittest.TestCase):
             ctx = FakeContext()
             store = RequestGoalStore(Path(tmp) / "goals.jsonl")
             route = register_request_goal_route(ctx, store)
-            self.assertEqual(set(ctx.tools), {"request_goal_bind", "request_goal_propose_amendment"})
+            self.assertEqual(set(ctx.tools), {"request_goal_offer_initial", "request_goal_bind", "request_goal_propose_amendment"})
             self.assertEqual(len(ctx.hooks["pre_llm_call"]), 1)
+            self.assertEqual(len(ctx.hooks["post_llm_call"]), 1)
             host = ctx.hooks["pre_llm_call"][0]
+            host(user_message="Help me plan an operations dashboard", session_id="plan", turn_id="p1",
+                 sender_id="u", platform="discord")
+            first_source = next(row for row in reversed(store._rows()) if row.get("kind") == "source")
+            rejected = json.loads(ctx.tools["request_goal_offer_initial"][1]({
+                "source_id": first_source["source_id"], "outcome": "Build a dashboard",
+                "question": "Before I implement, should I build a dashboard?"}, session_id="plan", turn_id="p1"))
+            self.assertFalse(rejected["ok"])
+            host(user_message="What functions should it have?", session_id="plan", turn_id="p2",
+                 sender_id="u", platform="discord")
+            second_source = next(row for row in reversed(store._rows()) if row.get("kind") == "source")
+            accepted = json.loads(ctx.tools["request_goal_offer_initial"][1]({
+                "source_id": second_source["source_id"], "outcome": "Build an operations dashboard",
+                "question": "Before I implement, should I build an operations dashboard?",
+                "completion_conditions": ["Dashboard runs locally"]}, session_id="plan", turn_id="p2"))
+            self.assertTrue(accepted["ok"], accepted)
+            self.assertIsNone(store.select_for_session("plan"))
+            route.post_llm_call(session_id="plan", turn_id="p2",
+                assistant_response="Before I implement, should I build an operations dashboard?")
+            self.assertIsNone(store.select_for_session("plan"))
+            route.host_message(user_message="I will think about it", session_id="plan", turn_id="p3",
+                sender_id="u", platform="discord")
+            self.assertIsNone(store.select_for_session("plan"))
+            confirmation_context = route.host_message(user_message="Yes", session_id="plan", turn_id="p4",
+                sender_id="u", platform="discord")
+            proposed_root = store.select_for_session("plan")
+            self.assertIsNotNone(proposed_root)
+            self.assertEqual(proposed_root["outcome"], "Build an operations dashboard")
+            self.assertEqual(json.loads(confirmation_context["context"])["request_goal"]["root_id"], proposed_root["root_id"])
             host(user_message="new request: Deliver daily news", session_id="s", turn_id="t1",
                  sender_id="u", platform="discord")
             bound = json.loads(host(user_message="new request: Deliver daily news", session_id="s", turn_id="t1",

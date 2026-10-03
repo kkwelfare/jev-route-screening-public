@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from . import bridge as _bridge
+from . import purpose_background as _purpose_background
 from .skill_router import TargetedReadingAdvisor
 from . import request_goals as _request_goals
 
@@ -52,7 +53,7 @@ def _record_worker_spawned_binding(ctx, **kwargs):
 
 def register(ctx):
     """Register existing behavior and any explicitly enabled default add-on."""
-    _bridge.register(ctx)
+    scope_guard = _bridge.register(ctx)
     # Request-goal tools are core bridge behavior, independent of optional reading.
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _bridge._config_value(ctx, "role", "")
@@ -61,7 +62,12 @@ def register(ctx):
         role, consumers = "consumer", {"default"}
     root = _bridge._config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
     if role == "consumer" and profile == "default" and profile in consumers and root:
-        _request_goals.register_request_goal_route(ctx, _request_goals.RequestGoalStore(Path(root) / "request-goals.jsonl"))
+        goal_store = _request_goals.RequestGoalStore(Path(root) / "request-goals.jsonl")
+        _request_goals.register_request_goal_route(ctx, goal_store)
+        if scope_guard is not None:
+            advisor = _purpose_background.PurposeBackgroundAdvisor(ctx, scope_guard, goal_store)
+            ctx.register_hook("post_llm_call", advisor.post_llm_call)
+            ctx.register_hook("pre_llm_call", advisor.pre_llm_call)
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _bridge._config_value(ctx, "role", "")
     consumers = _profile_list(_bridge._config_value(ctx, "consumer_profiles", []))

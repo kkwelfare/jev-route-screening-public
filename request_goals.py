@@ -109,6 +109,129 @@ class RequestGoalStore:
                           "identity": identity, "version": 1})
             return root
 
+    def offer_initial(self, *, source_id: str, outcome: str, question: str,
+                      completion_conditions: list[str] | None = None) -> dict[str, Any]:
+        """Stage an initial root proposal; only a later host confirmation binds it."""
+        for name, value in (("outcome", outcome), ("question", question)):
+            if not isinstance(value, str) or not value.strip():
+                raise GoalError(f"{name} is required")
+            if len(value.encode("utf-8")) > MAX_GOAL_BYTES:
+                raise GoalError(f"{name} exceeds 8KiB")
+        if completion_conditions is not None and (
+            not isinstance(completion_conditions, list)
+            or any(not isinstance(x, str) for x in completion_conditions)
+        ):
+            raise GoalError("completion_conditions must be a list of strings")
+        with _LOCK:
+            rows = self._rows()
+            source = next((r for r in reversed(rows)
+                          if r.get("kind") == "source" and r.get("source_id") == source_id), None)
+            if not source:
+                raise GoalError("goal offer source was not retained from the host")
+            identity = source.get("identity", {})
+            if any(not identity.get(key) for key in ("session_id", "turn_id", "sender_id", "platform")):
+                raise GoalError("goal offer source identity is incomplete")
+            if any(r.get("kind") == "selection" and
+                   r.get("identity", {}).get("session_id") == identity["session_id"] and
+                   r.get("identity", {}).get("sender_id") == identity["sender_id"] and
+                   r.get("identity", {}).get("platform") == identity["platform"] for r in rows):
+                raise GoalError("a request-level root is already selected for this host session")
+            pending = [r for r in rows if r.get("kind") == "initial_goal_offer"
+                       and r.get("status") in {"pending_delivery", "offered"}
+                       and r.get("identity", {}).get("session_id") == identity["session_id"]
+                       and r.get("identity", {}).get("sender_id") == identity["sender_id"]
+                       and r.get("identity", {}).get("platform") == identity["platform"]]
+            if pending:
+                raise GoalError("an initial goal proposal is already outstanding")
+            offer_id = "offer_" + uuid.uuid4().hex
+            row = {"kind": "initial_goal_offer", "offer_id": offer_id,
+                   "status": "pending_delivery", "outcome": outcome.strip(),
+                   "question": question.strip(),
+                   "completion_conditions": completion_conditions or [],
+                   "source_id": source_id, "identity": identity}
+            self._append(row)
+            return {"offer_id": offer_id, "question": row["question"],
+                    "outcome": row["outcome"], "completion_conditions": row["completion_conditions"]}
+
+    def mark_offer_delivered(self, *, offer_id: str, assistant_response: str,
+                             session_id: str, turn_id: str) -> bool:
+        """Mark only the exact proposal question found in its assistant turn."""
+        rows = self._rows()
+        offer = next((r for r in reversed(rows) if r.get("kind") == "initial_goal_offer"
+                      and r.get("offer_id") == offer_id), None)
+        if not offer or offer.get("status") != "pending_delivery":
+            return False
+        identity = offer.get("identity", {})
+        if identity.get("session_id") != session_id or identity.get("turn_id") != turn_id:
+            return False
+        question = offer.get("question")
+        if not isinstance(assistant_response, str) or not isinstance(question, str) or question not in assistant_response:
+            self._append({"kind": "initial_goal_offer_state", "offer_id": offer_id,
+                          "status": "not_delivered", "identity": identity})
+            return False
+        self._append({"kind": "initial_goal_offer_state", "offer_id": offer_id,
+                      "status": "offered", "identity": identity,
+                      "offered_turn_id": turn_id})
+        return True
+
+    @staticmethod
+    def _positive_confirmation(message: str) -> bool:
+        import re
+        text = " ".join(message.strip().casefold().split())
+        exact = {"ok", "okay", "yes", "y", "yep", "sure", "sounds good", "looks good",
+                 "that works", "go ahead", "了解", "はい", "いいです", "それでお願いします", "その内容でお願いします"}
+        return text in exact or bool(re.match(r"^(?:ok|okay|yes|yep|sure|了解|はい)[!,.、。 ]", text))
+
+    def confirm_initial_from_host(self, *, source_id: str, user_message: str,
+                                  session_id: str, turn_id: str, sender_id: str,
+                                  platform: str) -> dict[str, Any] | None:
+        """Bind a single outstanding delivered proposal on a later host turn."""
+        identity = _identity(locals())
+        if not self._positive_confirmation(user_message):
+            return None
+        with _LOCK:
+            rows = self._rows()
+            sources = {r.get("source_id"): r for r in rows if r.get("kind") == "source"}
+            source = sources.get(source_id)
+            if not source or source.get("message") != user_message:
+                return None
+            if source.get("identity") != identity:
+                return None
+            states: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if row.get("kind") == "initial_goal_offer":
+                    states[row["offer_id"]] = row
+                elif row.get("kind") == "initial_goal_offer_state":
+                    states[row["offer_id"]] = {**states.get(row["offer_id"], {}), **row}
+            candidates = [r for r in states.values() if r.get("status") == "offered"
+                          and r.get("identity", {}).get("session_id") == session_id
+                          and r.get("identity", {}).get("sender_id") == sender_id
+                          and r.get("identity", {}).get("platform") == platform
+                          and r.get("identity", {}).get("turn_id") != turn_id]
+            if len(candidates) != 1:
+                return None
+            offer = candidates[0]
+            root_id = "root_" + uuid.uuid4().hex
+            if any(r.get("kind") == "selection" and
+                   r.get("identity", {}).get("session_id") == session_id and
+                   r.get("identity", {}).get("sender_id") == sender_id and
+                   r.get("identity", {}).get("platform") == platform for r in rows):
+                return None
+            root_id = "root_" + uuid.uuid4().hex
+            root = {"kind": "root", "root_id": root_id, "version": 1,
+                    "outcome": offer["outcome"],
+                    "completion_conditions": offer.get("completion_conditions", []),
+                    "source_message": offer["question"], "source_id": offer["source_id"],
+                    "identity": offer["identity"], "confirmed_by_source_id": source_id,
+                    "confirmation_identity": identity, "local_milestones": []}
+            self._append({"kind": "initial_goal_offer_state", "offer_id": offer["offer_id"],
+                          "status": "confirmed", "confirmation_source_id": source_id,
+                          "confirmation_identity": identity, "root_id": root_id})
+            self._append(root)
+            self._append({"kind": "selection", "root_id": root_id,
+                          "identity": offer["identity"], "version": 1})
+            return root
+
     def select_for_host(self, *, session_id: str, turn_id: str,
                         sender_id: str, platform: str) -> dict[str, Any] | None:
         """Return the durable root selected for this exact host owner/session."""
@@ -273,6 +396,55 @@ class RequestGoalRoute:
     def __init__(self, store: RequestGoalStore):
         self.store = store
 
+    def offer_initial_tool(self, args: Mapping[str, Any] | None = None,
+                           session_id: str = "", turn_id: str = "", **_: Any) -> str:
+        args = args if isinstance(args, Mapping) else {}
+        try:
+            source_id = args.get("source_id")
+            source = next((r for r in reversed(self.store._rows())
+                           if r.get("kind") == "source" and r.get("source_id") == source_id), None)
+            identity = source.get("identity", {}) if source else {}
+            if identity.get("session_id") != session_id or identity.get("turn_id") != turn_id:
+                raise GoalError("goal proposal must reference a host message from this exact turn")
+            if len([r for r in self.store._rows() if r.get("kind") == "source"
+                    and r.get("identity", {}).get("session_id") == session_id]) < 2:
+                raise GoalError("offer a root only after a few consultation turns")
+            if not self._planning_transition(str(args.get("question", ""))):
+                raise GoalError("offer is allowed only at a design/implementation transition")
+            offered = self.store.offer_initial(source_id=source_id, outcome=args.get("outcome"),
+                question=args.get("question"), completion_conditions=args.get("completion_conditions"))
+            return json.dumps({"ok": True, **offered}, ensure_ascii=False)
+        except (GoalError, TypeError) as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @staticmethod
+    def _planning_transition(question: str) -> bool:
+        cues = ("before i implement", "before implementation", "shall i build",
+                "ready to implement", "implementation plan", "design proposal",
+                "実装に進む", "設計案", "作業に入る", "この方針で進め")
+        text = question.casefold()
+        return any(cue in text for cue in cues)
+
+    def post_llm_call(self, *, session_id: str = "", turn_id: str = "",
+                      assistant_response: Any = None, **_: Any) -> None:
+        if not isinstance(assistant_response, str):
+            return
+        rows = self.store._rows()
+        states: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row.get("kind") == "initial_goal_offer":
+                states[row["offer_id"]] = row
+            elif row.get("kind") == "initial_goal_offer_state":
+                states[row["offer_id"]] = {**states.get(row["offer_id"], {}), **row}
+        for offer in reversed(list(states.values())):
+            if offer.get("kind") != "initial_goal_offer" or offer.get("status") != "pending_delivery":
+                continue
+            identity = offer.get("identity", {})
+            if identity.get("session_id") == session_id and identity.get("turn_id") == turn_id:
+                self.store.mark_offer_delivered(offer_id=offer["offer_id"],
+                    assistant_response=assistant_response, session_id=session_id, turn_id=turn_id)
+                break
+
     def host_message(self, *, user_message: Any, session_id: str = "",
                      turn_id: str = "", sender_id: str = "", platform: str = "",
                      **_: Any) -> dict[str, str] | None:
@@ -286,6 +458,17 @@ class RequestGoalRoute:
                 sender_id=sender_id, platform=platform)
         except GoalError:
             return None
+        try:
+            confirmed = self.store.confirm_initial_from_host(source_id=source_id,
+                user_message=user_message, session_id=session_id, turn_id=turn_id,
+                sender_id=sender_id, platform=platform)
+        except GoalError:
+            confirmed = None
+        if confirmed:
+            return {"context": json.dumps({"request_goal": {
+                "root_id": confirmed["root_id"], "version": confirmed["version"],
+                "outcome": confirmed["outcome"],
+                "completion_conditions": confirmed.get("completion_conditions", [])}}, ensure_ascii=False)}
         # Exact proposal-specific response is the only amendment path.
         if not isinstance(user_message, str):
             return None
@@ -316,8 +499,9 @@ class RequestGoalRoute:
             return {"context": json.dumps({"request_goal": {
                 "root_id": root["root_id"], "version": root["version"],
                 "outcome": root["outcome"],
-                "completion_conditions": root.get("completion_conditions", [])}}, ensure_ascii=False)}
-        return {"context": f"Host-origin source candidate available: source_id={source_id}. No request-level root is selected; ordinary messages do not create or replace one."}
+                "completion_conditions": root.get("completion_conditions", []),
+                "guidance": "Keep this root fixed across local fixes. At a design/implementation transition after several consultation turns, call request_goal_offer_initial with this turn's host source_id and one concrete goal question; ask only if clarifying this outcome is useful. Never infer confirmation from tool/model text; only a later contextual host-user OK after the exact question was delivered binds it. Explicitly changed goals use the existing amendment proposal flow."}}, ensure_ascii=False)}
+        return {"context": f"Host-origin source candidate available: source_id={source_id}. No request-level root is selected; ordinary messages do not create or replace one. After a few consultation turns, at a design/implementation transition only, offer one specific question with request_goal_offer_initial; contextual host-user OK to the delivered question binds it. Do not infer a goal from the first message or model-authored approval."}
 
     def bind_tool(self, args: Mapping[str, Any] | None = None, **host: Any) -> str:
         """Read back the host-selected root; model args never select or bind it."""
@@ -342,6 +526,15 @@ class RequestGoalRoute:
 def register_request_goal_route(ctx: Any, store: RequestGoalStore) -> RequestGoalRoute:
     """Register proposal/bind tools; deliberately register no approval tool."""
     route = RequestGoalRoute(store)
+    ctx.register_tool(name="request_goal_offer_initial", toolset="jev_route_screening",
+        schema={"name": "request_goal_offer_initial", "description":
+            "At a design/implementation transition after several consultation turns, offer one concrete root-goal question. The exact question must be included in the assistant response; only a later contextual host-user OK confirms it. Never infer approval from model text.",
+            "parameters": {"type": "object", "properties": {
+                "source_id": {"type": "string", "description": "Host source ID from this exact turn."},
+                "outcome": {"type": "string"}, "question": {"type": "string"},
+                "completion_conditions": {"type": "array", "items": {"type": "string"}}},
+                "required": ["source_id", "outcome", "question"], "additionalProperties": False}},
+        handler=route.offer_initial_tool, description="Offer but do not bind or approve an initial request goal.")
     ctx.register_tool(name="request_goal_bind", toolset="jev_route_screening",
         schema={"name": "request_goal_bind", "description":
             "Read the request goal selected by the host callback for this session. Model arguments cannot select or replace a root.",
@@ -359,4 +552,5 @@ def register_request_goal_route(ctx: Any, store: RequestGoalStore) -> RequestGoa
                 "additionalProperties": False}},
         handler=route.propose_tool, description="Propose but never approve a goal amendment.")
     ctx.register_hook("pre_llm_call", route.host_message)
+    ctx.register_hook("post_llm_call", route.post_llm_call)
     return route
