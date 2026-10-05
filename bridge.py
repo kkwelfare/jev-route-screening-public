@@ -54,6 +54,20 @@ def _lifecycle_log(event: str, route: str, request_id: str, **fields: Any) -> No
         return
 
 
+def _validate_decision_input(value: Any, *, require_bound: bool = False) -> dict[str, Any]:
+    """Expose the public task-input contract expected by guarded creation."""
+    from .task_input_staging import _validate_decision_input as validate
+
+    return validate(value, require_bound=require_bound)
+
+
+def _extract_decision_input(body: str) -> dict[str, Any] | None:
+    """Read exactly one validated public decision-input marker from a task body."""
+    from .task_input_staging import _extract_persisted
+
+    return _extract_persisted(body)
+
+
 def _new_lifecycle_id() -> str:
     try:
         import uuid

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -274,14 +275,25 @@ class PointStatePolicy:
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
         self._store_path.write_text(_canonical_json(dict(self._store)) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _event_ordinal(event_id: str) -> int | None:
+        """Return an ordinal only for known checkpoint formats; opaque IDs are unordered."""
+        if not isinstance(event_id, str):
+            return None
+        if event_id.isdigit():
+            return int(event_id)
+        match = re.fullmatch(r"cp-(\d+)-[A-Za-z0-9]+", event_id)
+        if match:
+            return int(match.group(1))
+        return None
+
     def _event_is_stale(self, stream_key: str, event_id: str) -> bool:
         latest = self._store.get("latest_event", {}).get(stream_key)
         if latest is None:
             return False
-        try:
-            return int(event_id) < int(latest)
-        except (TypeError, ValueError):
-            return event_id != latest and str(event_id) < str(latest)
+        current_order = self._event_ordinal(event_id)
+        latest_order = self._event_ordinal(latest)
+        return current_order is not None and latest_order is not None and current_order < latest_order
 
     def _remember_event(self, stream_key: str, event_id: str) -> None:
         latest_events = self._store.setdefault("latest_event", {})
@@ -289,12 +301,10 @@ class PointStatePolicy:
         if latest is None:
             latest_events[stream_key] = event_id
             return
-        try:
-            if int(event_id) > int(latest):
-                latest_events[stream_key] = event_id
-        except (TypeError, ValueError):
-            if str(event_id) > str(latest):
-                latest_events[stream_key] = event_id
+        current_order = self._event_ordinal(event_id)
+        latest_order = self._event_ordinal(latest)
+        if current_order is not None and latest_order is not None and current_order > latest_order:
+            latest_events[stream_key] = event_id
 
     def _budget(self, budget_key: str) -> int:
         return int(self._store.setdefault("budgets", {}).get(budget_key, 0))

@@ -142,6 +142,45 @@ class PointStateContractTests(unittest.TestCase):
         self.assertEqual(second.action, "review")
         self.assertEqual(second.reason, "correction_budget_exhausted")
 
+    def test_numeric_checkpoint_order_is_not_lexical_and_is_stream_scoped(self):
+        policy = PointStatePolicy()
+        decision = parse_point_state_response({"state": "ordinary_action_ready", "confidence": 0.8})
+        def apply(event_id, task="task", run="run"):
+            snapshot = {"expected_next_action": "continue", "checkpoint": event_id}
+            return policy.evaluate(decision, PointIdentity.from_snapshot(task, run, event_id, snapshot), issue="i", milestone="m", snapshot=snapshot)
+
+        first = apply("cp-9-fingerprint9")
+        newer = apply("cp-12-fingerprint12")
+        stale = apply("cp-9-fingerprint9")
+        self.assertTrue(first.applied)
+        self.assertTrue(newer.applied)
+        self.assertEqual(stale.reason, "stale_event")
+        reverse_policy = PointStatePolicy()
+        def reverse(event_id):
+            snapshot = {"expected_next_action": "continue", "checkpoint": event_id}
+            return reverse_policy.evaluate(decision, PointIdentity.from_snapshot("task", "run", event_id, snapshot), issue="i", milestone="m", snapshot=snapshot)
+        self.assertTrue(reverse("cp-12-fingerprint12").applied)
+        self.assertEqual(reverse("cp-9-fingerprint9").reason, "stale_event")
+        # A new run has a distinct stream and opaque IDs are not lexically ordered.
+        self.assertTrue(apply("opaque-z", run="fresh").applied)
+        self.assertTrue(apply("opaque-a", run="fresh").applied)
+
+    def test_checkpoint_order_survives_store_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            decision = parse_point_state_response({"state": "ordinary_action_ready", "confidence": 0.8})
+            snapshot = {"expected_next_action": "continue"}
+            PointStatePolicy(store_path=path).evaluate(
+                decision, PointIdentity.from_snapshot("task", "run", "cp-12-abcdef12", snapshot),
+                issue="i", milestone="m", snapshot=snapshot,
+            )
+            reloaded = PointStatePolicy(store_path=path)
+            stale = reloaded.evaluate(
+                decision, PointIdentity.from_snapshot("task", "run", "cp-9-abcdef09", snapshot),
+                issue="i", milestone="m", snapshot=snapshot,
+            )
+            self.assertEqual(stale.reason, "stale_event")
+
     def test_evidence_missing_without_discovery_context_continues_in_scope(self):
         store = {}
         policy = PointStatePolicy(store=store, max_refreshes=0)
