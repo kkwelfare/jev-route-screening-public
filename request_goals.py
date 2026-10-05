@@ -176,11 +176,22 @@ class RequestGoalStore:
 
     @staticmethod
     def _positive_confirmation(message: str) -> bool:
-        import re
-        text = " ".join(message.strip().casefold().split())
-        exact = {"ok", "okay", "yes", "y", "yep", "sure", "sounds good", "looks good",
-                 "that works", "go ahead", "了解", "はい", "いいです", "それでお願いします", "その内容でお願いします"}
-        return text in exact or bool(re.match(r"^(?:ok|okay|yes|yep|sure|了解|はい)[!,.、。 ]", text))
+        import unicodedata
+
+        def normalize(value: str) -> str:
+            folded = unicodedata.normalize("NFKC", value).casefold()
+            without_punctuation = "".join(
+                char for char in folded
+                if not unicodedata.category(char).startswith("P")
+            )
+            return " ".join(without_punctuation.split())
+
+        exact = {
+            "ok", "okay", "yes", "y", "yep", "sure", "sounds good", "looks good",
+            "that works", "go ahead", "了解", "はい", "いいです", "それでお願いします",
+            "その内容でお願いします",
+        }
+        return normalize(message) in exact
 
     def confirm_initial_from_host(self, *, source_id: str, user_message: str,
                                   session_id: str, turn_id: str, sender_id: str,

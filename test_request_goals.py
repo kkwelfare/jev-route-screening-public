@@ -19,6 +19,21 @@ class RequestGoalTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_initial_confirmation_requires_exact_safe_affirmative(self):
+        positive = ("OK", "Okay!", "YES.", "はい！", "それでお願いします。")
+        negative = (
+            "はい、ただしその案では進めないでください。",
+            "yes, but do not proceed with that plan",
+            "OK, but only if you change it",
+            "yes and also send it to everyone",
+            "not okay",
+            "maybe yes",
+        )
+        for message in positive:
+            self.assertTrue(RequestGoalStore._positive_confirmation(message), message)
+        for message in negative:
+            self.assertFalse(RequestGoalStore._positive_confirmation(message), message)
+
     def test_local_repair_and_unfamiliar_wording_do_not_replace_root(self):
         self.store.add_local_milestone(root_id=self.root["root_id"],
                                        milestone="repair validator error")

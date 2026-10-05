@@ -49,7 +49,16 @@ class RegisteredRouteTests(unittest.TestCase):
             route.host_message(user_message="I will think about it", session_id="plan", turn_id="p3",
                 sender_id="u", platform="discord")
             self.assertIsNone(store.select_for_session("plan"))
-            confirmation_context = route.host_message(user_message="Yes", session_id="plan", turn_id="p4",
+            for unsafe_message in (
+                    "Yes, but do not proceed with that plan",
+                    "はい、ただしその案では進めないでください。",
+                    "OK and also send it to everyone"):
+                unsafe_context = route.host_message(user_message=unsafe_message,
+                    session_id="plan", turn_id="p4-unsafe", sender_id="u", platform="discord")
+                self.assertIsNone(store.select_for_session("plan"))
+                self.assertIsNotNone(unsafe_context)
+                self.assertIn("No request-level root is selected", unsafe_context["context"])
+            confirmation_context = route.host_message(user_message="Yes!", session_id="plan", turn_id="p4",
                 sender_id="u", platform="discord")
             proposed_root = store.select_for_session("plan")
             self.assertIsNotNone(proposed_root)
