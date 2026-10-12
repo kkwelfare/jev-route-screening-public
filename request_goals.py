@@ -45,6 +45,14 @@ class RequestGoalStore:
             except json.JSONDecodeError as exc:
                 raise GoalError("goal event log contains invalid JSON") from exc
             if isinstance(row, dict):
+                if row.get("kind") == "initial_goal_confirmation":
+                    offer_state = row.get("offer_state")
+                    root = row.get("root")
+                    selection = row.get("selection")
+                    if (isinstance(offer_state, dict) and isinstance(root, dict)
+                            and isinstance(selection, dict)):
+                        rows.extend((offer_state, root, selection))
+                    continue
                 rows.append(row)
         return rows
 
@@ -235,12 +243,15 @@ class RequestGoalStore:
                     "source_message": offer["question"], "source_id": offer["source_id"],
                     "identity": offer["identity"], "confirmed_by_source_id": source_id,
                     "confirmation_identity": identity, "local_milestones": []}
-            self._append({"kind": "initial_goal_offer_state", "offer_id": offer["offer_id"],
-                          "status": "confirmed", "confirmation_source_id": source_id,
-                          "confirmation_identity": identity, "root_id": root_id})
-            self._append(root)
-            self._append({"kind": "selection", "root_id": root_id,
-                          "identity": offer["identity"], "version": 1})
+            self._append({
+                "kind": "initial_goal_confirmation",
+                "offer_state": {"kind": "initial_goal_offer_state", "offer_id": offer["offer_id"],
+                                "status": "confirmed", "confirmation_source_id": source_id,
+                                "confirmation_identity": identity, "root_id": root_id},
+                "root": root,
+                "selection": {"kind": "selection", "root_id": root_id,
+                              "identity": offer["identity"], "version": 1},
+            })
             return root
 
     def select_for_host(self, *, session_id: str, turn_id: str,
