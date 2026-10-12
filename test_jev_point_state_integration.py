@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -63,6 +64,22 @@ def _event(bridge, *, task_id="task-point", run_id="run-point", checkpoint_id="c
         "sensitive": False,
         "projection_safe": True,
     }
+    decision_input = {
+        "schema_version": 1, "scope": "offline point-state fixture", "objective": "verify point state",
+        "target_candidates": [], "requested_outcome": "offline", "action_mode": "read_only",
+        "allowed_actions": ["read fixture"], "forbidden_actions": ["external side effect"],
+        "decision_points": [], "freshness": {"status": "fresh", "observed_at": "2026-01-01T00:00:00Z",
+        "valid_until": "2099-01-01T00:00:00Z", "rule": "offline"},
+        "deduplication": {"status": "not_applicable", "basis": "offline"},
+        "baseline": {"status": "defined", "value": "offline"},
+        "completion_conditions": ["preserve point-state behavior"], "prior_context": {"summary": "fixture"},
+        "signals": [], "feedback": [], "output_requirements": {"format": "offline"}, "uncertainty": [],
+        "provenance": {"task_id": task_id, "source": "offline_test_fixture",
+        "captured_at": "2026-01-01T00:00:00Z", "source_references": [f"kanban://task/{task_id}"]},
+        "domain_extension": None,
+    }
+    raw["decision_input"] = bridge._validate_decision_input(decision_input)
+    raw["decision_input_sha256"] = bridge._decision_input_digest(raw["decision_input"])
     event = bridge.validate_checkpoint(raw)
     event["state"] = "pending"
     return event
@@ -172,8 +189,7 @@ def test_real_plugin_manager_point_state_route_and_legacy_default_branch():
         # DefaultScopeGuard keeps the established legacy scope classifier.
         assert guard.point_state_enabled is False
 
-        event = _event(bridge)
-        consumer.store.append_event(event)
+        consumer.store.append_event(_event(bridge))
         calls = []
         with patch.object(bridge, "_post_provider", side_effect=_point_sender(calls)):
             assert consumer.process_pending() is True
@@ -476,7 +492,13 @@ def test_acceptance_ready_requires_bound_default_readback_and_releases_hold():
         assert not consumer.store.reviews()[-1]["completion_allowed"]
 
         binding = (event["task_id"], str(event["run_id"]))
-        with patch.object(bridge, "_worker_binding", return_value=binding):
+        contract = SimpleNamespace(
+            profile="ops", task_id=event["task_id"], run_id=event["run_id"],
+            decision_input=event["decision_input"],
+        )
+        with patch.object(bridge, "_worker_binding", return_value=binding), patch.object(
+            bridge, "_load_dispatcher_contract", return_value=contract
+        ):
             blocked = producer.pre_tool_call("read_file", {"path": "after-acceptance"})
         assert blocked is not None and blocked["action"] == "block"
 
@@ -498,7 +520,9 @@ def test_acceptance_ready_requires_bound_default_readback_and_releases_hold():
             )
         assert consumer.store.triggers()[-1]["state"] == "pending_review"
         assert consumer.store.controls()[0]["control"] == "provisional_stop"
-        with patch.object(bridge, "_worker_binding", return_value=binding):
+        with patch.object(bridge, "_worker_binding", return_value=binding), patch.object(
+            bridge, "_load_dispatcher_contract", return_value=contract
+        ):
             assert producer.pre_tool_call("read_file", {"path": "still-held"}) is not None
 
         released = consumer.record_default_decision(trigger["trigger_id"], "no_intervention", readback)
@@ -506,5 +530,7 @@ def test_acceptance_ready_requires_bound_default_readback_and_releases_hold():
         assert released["state"] == "no_intervention"
         assert str(released["run_id"]) == str(event["run_id"])
         assert consumer.store.controls()[-1]["control"] == "release"
-        with patch.object(bridge, "_worker_binding", return_value=binding):
+        with patch.object(bridge, "_worker_binding", return_value=binding), patch.object(
+            bridge, "_load_dispatcher_contract", return_value=contract
+        ):
             assert producer.pre_tool_call("read_file", {"path": "after-release"}) is None

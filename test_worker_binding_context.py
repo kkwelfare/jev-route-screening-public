@@ -11,7 +11,7 @@ from typing import Any
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent
-OPS_ROOT = Path(os.environ.get("JEV_OPS_PLUGIN_ROOT") or DEFAULT_ROOT).expanduser().resolve()
+OPS_ROOT = DEFAULT_ROOT
 
 
 def _load_package(package_name: str, root: Path) -> Any:
@@ -29,13 +29,16 @@ def _load_package(package_name: str, root: Path) -> Any:
 
 
 def _load_module(module_name: str, path: Path) -> Any:
-    spec = importlib.util.spec_from_file_location(module_name, path)
+    package_name = module_name + "_package"
+    spec = importlib.util.spec_from_file_location(
+        package_name, path.parent / "__init__.py", submodule_search_locations=[str(path.parent)]
+    )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+        raise RuntimeError(f"could not load plugin package from {path.parent}")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = package
+    spec.loader.exec_module(package)
+    return sys.modules[f"{package_name}.bridge"]
 
 
 class FakeContext:

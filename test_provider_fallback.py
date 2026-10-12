@@ -11,11 +11,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 MODULE_NAME = "jev_route_screening_bridge_provider_test"
-spec = importlib.util.spec_from_file_location(MODULE_NAME, ROOT / "bridge.py", submodule_search_locations=[str(ROOT)])
+PACKAGE_NAME = "jev_route_screening_provider_fallback_test"
+spec = importlib.util.spec_from_file_location(
+    PACKAGE_NAME,
+    ROOT / "__init__.py",
+    submodule_search_locations=[str(ROOT)],
+)
 assert spec is not None and spec.loader is not None
-bridge = importlib.util.module_from_spec(spec)
-sys.modules[MODULE_NAME] = bridge
-spec.loader.exec_module(bridge)
+package = importlib.util.module_from_spec(spec)
+sys.modules[PACKAGE_NAME] = package
+spec.loader.exec_module(package)
+bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
 
 
 LABELS = bridge.LABELS

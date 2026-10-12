@@ -32,12 +32,12 @@ from .point_state import (
 
 log = logging.getLogger("hermes_plugins.jev_lifecycle.bridge")
 log.setLevel(logging.INFO)
-if not any(getattr(handler, "_jev_lifecycle_console", False) for handler in log.handlers):
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter("%(message)s"))
-    setattr(console, "_jev_lifecycle_console", True)
-    log.addHandler(console)
+if not any(getattr(h, "_jev_lifecycle_console", False) for h in log.handlers):
+    _console = logging.StreamHandler()
+    _console.setLevel(logging.INFO)
+    _console.setFormatter(logging.Formatter("%(message)s"))
+    setattr(_console, "_jev_lifecycle_console", True)
+    log.addHandler(_console)
 
 
 def _lifecycle_log(event: str, route: str, request_id: str, **fields: Any) -> None:
@@ -45,27 +45,14 @@ def _lifecycle_log(event: str, route: str, request_id: str, **fields: Any) -> No
     try:
         allowed = {"provider", "transport", "attempt", "status", "fallback", "failure", "destination", "classification", "confidence"}
         safe = {key: value for key, value in fields.items() if key in allowed}
-        clean = lambda value, limit: re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(value))[:limit]
+        route_value = re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(route))[:96]
+        request_value = re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(request_id))[:80]
         for key, value in list(safe.items()):
             if isinstance(value, str):
-                safe[key] = clean(value, 96)
-        log.info("jev.lifecycle event=%s route=%s request_id=%s metadata=%s", clean(event, 64), clean(route, 96), clean(request_id, 80), json.dumps(safe, sort_keys=True, separators=(",", ":")))
+                safe[key] = re.sub(r"[^A-Za-z0-9_.:+-]", "_", value)[:96]
+        log.info("jev.lifecycle event=%s route=%s request_id=%s metadata=%s", event, route_value, request_value, json.dumps(safe, sort_keys=True, separators=(",", ":")))
     except Exception:
         return
-
-
-def _validate_decision_input(value: Any, *, require_bound: bool = False) -> dict[str, Any]:
-    """Expose the public task-input contract expected by guarded creation."""
-    from .task_input_staging import _validate_decision_input as validate
-
-    return validate(value, require_bound=require_bound)
-
-
-def _extract_decision_input(body: str) -> dict[str, Any] | None:
-    """Read exactly one validated public decision-input marker from a task body."""
-    from .task_input_staging import _extract_persisted
-
-    return _extract_persisted(body)
 
 
 def _new_lifecycle_id() -> str:
@@ -118,11 +105,79 @@ PURPOSE_CRITERIA = {
 MAX_PURPOSE_HISTORY_MESSAGES = 8
 MAX_PURPOSE_MESSAGE_CHARS = 320
 MAX_PURPOSE_CONTEXT_CHARS = 1_600
-MAX_EVENT_BYTES = 16_000
+MAX_EVENT_BYTES = 96_000
+MAX_DECISION_INPUT_BYTES = 64_000
+MAX_TASK_BODY_BYTES = 192_000
+MAX_DECISION_TARGETS = 64
+MAX_DECISION_SIGNALS = 20
+DECISION_INPUT_SCHEMA_VERSION = 1
+NEWS_DOMAIN_EXTENSION = "daily_interest_news_curation_v1"
 MAX_LIVE_CALLS_PER_RUN = 3
 MAX_CALLS_PER_RUN = 3
 RESERVATION_USD = Decimal("0.005")
 REQUEST_TIMEOUT_SECONDS = 15.0
+NEWS_BROAD_SEARCH_CALL_CAP = 3
+NEWS_CONSECUTIVE_NO_GAIN_STOP = 2
+MAX_SUFFICIENCY_INPUT_BYTES = 4_096
+MAX_SUFFICIENCY_COUNT = 10_000
+MAX_SUFFICIENCY_CATEGORIES = 24
+SUFFICIENCY_CONFIDENCE_THRESHOLD = 0.8
+SUFFICIENCY_CATEGORIES_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+NEWS_SEARCH_ADVICE_EXTENSION = "daily_news_search_advice_v1"
+MAX_SEARCH_ADVICE_INPUT_BYTES = 4_096
+MAX_SEARCH_ADVICE_CANDIDATES = 8
+MAX_SEARCH_ADVICE_TERMS_PER_GROUP = 8
+MAX_SEARCH_ADVICE_TERM_CHARS = 120
+SEARCH_ADVICE_CONFIDENCE_THRESHOLD = Decimal("0.8")
+SEARCH_ADVICE_CANDIDATE_ID_PATTERN = re.compile(r"^c[1-8]$")
+SUFFICIENCY_STATUSES = ("snapshot_sufficient", "more_evidence_needed", "invalid_snapshot")
+SUFFICIENCY_CHOICES = {
+    "snapshot_sufficient": (
+        "snapshot_sufficient", "aggregate_consistent",
+        "The complete aggregate snapshot is internally consistent and meets the represented sufficiency checks.",
+    ),
+    "more_evidence_coverage_incomplete": (
+        "more_evidence_needed", "coverage_incomplete",
+        "Coverage is incomplete or unknown; use the existing direct-search rules.",
+    ),
+    "more_evidence_unresolved_checks": (
+        "more_evidence_needed", "unresolved_checks",
+        "Freshness, source, or deduplication checks remain unresolved.",
+    ),
+    "more_evidence_required_mix_missing": (
+        "more_evidence_needed", "required_mix_missing",
+        "The required non-AI/communication coverage condition is not met.",
+    ),
+    "more_evidence_search_not_exhausted": (
+        "more_evidence_needed", "search_not_exhausted",
+        "An empty candidate set has not reached the existing three-call or two-consecutive-no-gain stop condition.",
+    ),
+    "more_evidence_aggregate_needs_review": (
+        "more_evidence_needed", "aggregate_needs_review",
+        "The aggregates do not establish sufficiency; do not infer completeness.",
+    ),
+    "invalid_snapshot_aggregate_inconsistent": (
+        "invalid_snapshot", "aggregate_inconsistent",
+        "The aggregate snapshot appears internally inconsistent.",
+    ),
+}
+SUFFICIENCY_REASON_CODES = frozenset(
+    outcome[1] for outcome in SUFFICIENCY_CHOICES.values()
+) | frozenset({"invalid_input", "provider_unavailable", "provider_ambiguous"})
+SUFFICIENCY_SNAPSHOT_FIELDS = frozenset({
+    "snapshot_version",
+    "broad_search_calls_used",
+    "broad_search_call_cap",
+    "total_verified_eligible_candidate_count",
+    "verified_counts_by_broad_category",
+    "required_non_ai_communication_count",
+    "required_non_ai_communication_condition_met",
+    "unresolved_freshness_check_count",
+    "unresolved_source_check_count",
+    "unresolved_dedup_check_count",
+    "coverage_status",
+    "consecutive_no_gain_count",
+})
 
 
 @dataclass(frozen=True)
@@ -246,6 +301,282 @@ def _safe_text(value: Any, name: str, limit: int, *, allow_empty: bool = False) 
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
     return text
+
+
+def _bounded_root_goal(value: Any, name: str = "root_goal") -> str:
+    """Keep the persisted authoritative goal intact; reject rather than truncate."""
+    if not isinstance(value, str) or not value.strip():
+        raise BridgeValidationError(f"{name} must be a non-empty string")
+    if len(value.encode("utf-8")) > 8192:
+        raise BridgeValidationError(f"{name} exceeds the 8KiB UTF-8 bound")
+    return value
+
+
+def _decision_input_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _decision_input_timestamp(value: Any, name: str) -> dt.datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise BridgeValidationError(f"{name} must be an explicit timezone-aware timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        raise BridgeValidationError(f"{name} must be an explicit timezone-aware timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise BridgeValidationError(f"{name} must include a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _decision_input_digest(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _reject_blocking_unknowns(value: Any, path: str = "decision_input") -> None:
+    blocked = {"unknown", "missing", "malformed", "truncated", "stale", "unresolved", "incomplete", "unverified"}
+    if isinstance(value, Mapping):
+        for key in ("status", "state", "resolution_status"):
+            marker = value.get(key)
+            if isinstance(marker, str) and marker.strip().lower() in blocked:
+                raise BridgeValidationError(f"{path}.{key} is {marker.strip().lower()}")
+        for key in ("resolved", "loaded"):
+            if value.get(key) is False:
+                raise BridgeValidationError(f"{path}.{key} is false")
+        if value.get("truncated") is True or value.get("malformed") is True or value.get("stale") is True:
+            raise BridgeValidationError(f"{path} is explicitly incomplete")
+        for key, child in value.items():
+            if child is None and key not in {"domain_extension", "valid_until", "truncation_cause"}:
+                raise BridgeValidationError(f"{path}.{key} is missing")
+            _reject_blocking_unknowns(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            if child is None:
+                raise BridgeValidationError(f"{path}[{index}] is missing")
+            _reject_blocking_unknowns(child, f"{path}[{index}]")
+    elif isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in blocked or normalized.startswith(tuple(f"{item}:" for item in blocked)):
+            raise BridgeValidationError(f"{path} contains an explicit unknown or incomplete value")
+
+
+def _validate_news_extension(value: Any, *, now: dt.datetime) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping) or value.get("type") != NEWS_DOMAIN_EXTENSION:
+        raise BridgeValidationError("domain_extension must be null or a supported typed extension")
+    required = {
+        "type", "candidate_ids", "candidate_records", "unresolved_candidate_ids",
+        "freshness_dedup_context", "user_interest_inputs", "feedback_inputs",
+        "allowed_operations", "forbidden_operations", "completion_conditions",
+        "output_requirements", "source_references", "handoff_status", "coverage", "truncation_cause",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise BridgeValidationError("daily-interest extension missing fields: " + ",".join(missing))
+    if value.get("handoff_status") != "complete" or value.get("truncation_cause") not in (None, ""):
+        raise BridgeValidationError("daily-interest handoff is incomplete or truncated")
+    coverage = value.get("coverage")
+    if not isinstance(coverage, Mapping):
+        raise BridgeValidationError("daily-interest coverage must be an explicit object")
+    seen, expected = coverage.get("seen"), coverage.get("expected")
+    if (isinstance(seen, bool) or not isinstance(seen, int) or seen < 0
+            or isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+            or seen != expected):
+        raise BridgeValidationError("daily-interest coverage is unknown or incomplete")
+    candidate_ids = value.get("candidate_ids")
+    records = value.get("candidate_records")
+    unresolved = value.get("unresolved_candidate_ids")
+    if not isinstance(candidate_ids, list) or len(candidate_ids) > 12 or any(not isinstance(item, str) or not item.strip() for item in candidate_ids):
+        raise BridgeValidationError("candidate_ids must be a list of at most 12 non-empty ids")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise BridgeValidationError("candidate_ids must be unique")
+    if not isinstance(records, list) or len(records) > 12 or len(records) != len(candidate_ids):
+        raise BridgeValidationError("candidate_records must preserve every candidate id")
+    if not isinstance(unresolved, list):
+        raise BridgeValidationError("unresolved_candidate_ids must be explicit candidate ids")
+    if any(not isinstance(item, str) or not item.strip() or item not in candidate_ids for item in unresolved):
+        raise BridgeValidationError("unresolved_candidate_ids must be explicit candidate ids")
+    if len(set(unresolved)) != len(unresolved):
+        raise BridgeValidationError("unresolved_candidate_ids must be unique")
+    if unresolved:
+        raise BridgeValidationError("unresolved candidate references block Jev")
+    if [record.get("candidate_id") if isinstance(record, Mapping) else None for record in records] != candidate_ids:
+        raise BridgeValidationError("candidate_records do not exactly match candidate_ids")
+    for index, record in enumerate(records):
+        prefix = f"domain_extension.candidate_records[{index}]"
+        if not isinstance(record, Mapping):
+            raise BridgeValidationError(f"{prefix} must be an object")
+        fields = {
+            "candidate_id", "title", "url", "source", "published_at", "fetched_at",
+            "relevant_content", "freshness_context", "deduplication_context",
+            "content_sha256", "source_references",
+        }
+        missing_record = sorted(fields - set(record))
+        if missing_record:
+            raise BridgeValidationError(f"{prefix} missing fields: " + ",".join(missing_record))
+        for key in ("candidate_id", "title", "url", "source", "relevant_content", "content_sha256"):
+            if not isinstance(record.get(key), str) or not record[key].strip():
+                raise BridgeValidationError(f"{prefix}.{key} must be non-empty")
+        if not record["url"].startswith(("https://", "http://")):
+            raise BridgeValidationError(f"{prefix}.url must be an absolute HTTP(S) URL")
+        published = _decision_input_timestamp(record.get("published_at"), f"{prefix}.published_at")
+        fetched = _decision_input_timestamp(record.get("fetched_at"), f"{prefix}.fetched_at")
+        if published > now or fetched > now or published > fetched:
+            raise BridgeValidationError(f"{prefix} contains a future timestamp")
+        content = record["relevant_content"]
+        if len(content.encode("utf-8")) > 12_000:
+            raise BridgeValidationError(f"{prefix}.relevant_content exceeds the inline limit")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if record["content_sha256"] != digest:
+            raise BridgeValidationError(f"{prefix}.content_sha256 does not match the inline content")
+        refs = record.get("source_references")
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or not ref.startswith(("https://", "http://")) for ref in refs):
+            raise BridgeValidationError(f"{prefix}.source_references must contain loaded inline-source URLs")
+        for key in ("freshness_context", "deduplication_context"):
+            context = record.get(key)
+            if not isinstance(context, (str, Mapping, list)) or (isinstance(context, str) and not context.strip()):
+                raise BridgeValidationError(f"{prefix}.{key} is required")
+    if not isinstance(value.get("freshness_dedup_context"), Mapping):
+        raise BridgeValidationError("daily-interest freshness_dedup_context must be an object")
+    for key in ("user_interest_inputs", "feedback_inputs"):
+        if not isinstance(value.get(key), (Mapping, list)):
+            raise BridgeValidationError(f"daily-interest {key} must be an explicit object or list")
+    for key in ("allowed_operations", "forbidden_operations", "completion_conditions"):
+        rows = value.get(key)
+        if not isinstance(rows, list) or not rows or any(not isinstance(row, str) or not row.strip() for row in rows):
+            raise BridgeValidationError(f"daily-interest {key} must be an explicit list of non-empty strings")
+    if not isinstance(value.get("output_requirements"), Mapping):
+        raise BridgeValidationError("daily-interest output_requirements must be an object")
+    refs = value.get("source_references")
+    if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+        raise BridgeValidationError("daily-interest source_references must be an explicit list")
+
+
+def _validate_decision_input(raw: Any, *, now: dt.datetime | None = None) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise BridgeValidationError("jev_decision_input_json is missing or not an object")
+    required = {
+        "schema_version", "scope", "objective", "target_candidates", "requested_outcome",
+        "action_mode", "allowed_actions", "forbidden_actions", "decision_points", "freshness",
+        "deduplication", "baseline", "completion_conditions", "prior_context", "signals",
+        "feedback", "output_requirements", "uncertainty", "provenance", "domain_extension",
+    }
+    missing = sorted(required - set(raw))
+    if missing:
+        raise BridgeValidationError("jev_decision_input_json missing fields: " + ",".join(missing))
+    try:
+        packed = json.dumps(dict(raw), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        size = len(packed.encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError):
+        raise BridgeValidationError("jev_decision_input_json is not strict JSON")
+    if size > MAX_DECISION_INPUT_BYTES:
+        raise BridgeValidationError("jev_decision_input_json exceeds the inline byte limit")
+    value = json.loads(packed)
+    if value.get("schema_version") != DECISION_INPUT_SCHEMA_VERSION:
+        raise BridgeValidationError("jev_decision_input_json schema_version is unsupported")
+    for key in ("scope", "objective", "requested_outcome", "action_mode"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise BridgeValidationError(f"jev_decision_input_json.{key} must be explicit")
+    targets = value.get("target_candidates")
+    if not isinstance(targets, list) or len(targets) > MAX_DECISION_TARGETS or any(not isinstance(row, (str, Mapping)) for row in targets):
+        raise BridgeValidationError("target_candidates must be a bounded list of explicit records")
+    for key in ("allowed_actions", "forbidden_actions"):
+        rows = value.get(key)
+        if not isinstance(rows, list) or any(not isinstance(row, str) or not row.strip() for row in rows):
+            raise BridgeValidationError(f"{key} must be an explicit list")
+    for key in ("decision_points", "completion_conditions", "signals", "feedback", "uncertainty"):
+        if not isinstance(value.get(key), list):
+            raise BridgeValidationError(f"{key} must be an explicit list")
+    if not value["completion_conditions"] or any(not isinstance(row, str) or not row.strip() for row in value["completion_conditions"]):
+        raise BridgeValidationError("completion_conditions must contain explicit non-empty strings")
+    for key in ("prior_context", "freshness", "deduplication", "provenance"):
+        if not isinstance(value.get(key), Mapping):
+            raise BridgeValidationError(f"{key} must be an explicit object")
+    if not isinstance(value.get("baseline"), (Mapping, list)) or not isinstance(value.get("output_requirements"), (Mapping, list)):
+        raise BridgeValidationError("baseline and output_requirements must be explicit objects or lists")
+    current = (now or _decision_input_now()).astimezone(dt.timezone.utc)
+    freshness = value["freshness"]
+    if freshness.get("status") not in {"fresh", "not_time_sensitive"}:
+        raise BridgeValidationError("freshness is unknown, stale, or unresolved")
+    observed_at = _decision_input_timestamp(freshness.get("observed_at"), "freshness.observed_at")
+    if observed_at > current:
+        raise BridgeValidationError("freshness.observed_at is in the future")
+    valid_until = freshness.get("valid_until")
+    if freshness["status"] == "fresh":
+        expiry = _decision_input_timestamp(valid_until, "freshness.valid_until")
+        if expiry < observed_at or current > expiry:
+            raise BridgeValidationError("decision input is stale")
+    elif valid_until is not None:
+        expiry = _decision_input_timestamp(valid_until, "freshness.valid_until")
+        if expiry < observed_at or current > expiry:
+            raise BridgeValidationError("decision input is stale")
+    if not isinstance(freshness.get("rule"), str) or not freshness["rule"].strip():
+        raise BridgeValidationError("freshness.rule must state the applied rule")
+    dedup = value["deduplication"]
+    if dedup.get("status") not in {"checked", "not_applicable"} or not isinstance(dedup.get("basis"), str) or not dedup["basis"].strip():
+        raise BridgeValidationError("deduplication must be checked or explicitly not_applicable")
+    if dedup["status"] == "checked":
+        _decision_input_timestamp(dedup.get("checked_at"), "deduplication.checked_at")
+    provenance = value["provenance"]
+    if not isinstance(provenance.get("task_id"), str) or not provenance["task_id"].strip() or not isinstance(provenance.get("source"), str) or not provenance["source"].strip():
+        raise BridgeValidationError("provenance.task_id and provenance.source are required")
+    _decision_input_timestamp(provenance.get("captured_at"), "provenance.captured_at")
+    if not isinstance(provenance.get("source_references"), list) or any(not isinstance(ref, str) or not ref.strip() for ref in provenance["source_references"]):
+        raise BridgeValidationError("provenance.source_references must be explicit")
+    if not provenance["source_references"]:
+        raise BridgeValidationError("provenance.source_references cannot be empty")
+    if len(value["signals"]) + len(value["feedback"]) > MAX_DECISION_SIGNALS:
+        raise BridgeValidationError("signals and feedback exceed the combined limit")
+    if _decision_input_timestamp(provenance["captured_at"], "provenance.captured_at") > current:
+        raise BridgeValidationError("provenance.captured_at is in the future")
+    if dedup["status"] == "checked" and _decision_input_timestamp(dedup["checked_at"], "deduplication.checked_at") > current:
+        raise BridgeValidationError("deduplication.checked_at is in the future")
+    _reject_blocking_unknowns(value)
+    _validate_news_extension(value.get("domain_extension"), now=current)
+    extension = value.get("domain_extension")
+    if isinstance(extension, Mapping) and extension.get("type") == NEWS_DOMAIN_EXTENSION:
+        target_ids = [row.get("candidate_id") if isinstance(row, Mapping) else None for row in targets]
+        if target_ids != extension.get("candidate_ids") or targets != extension.get("candidate_records"):
+            raise BridgeValidationError("target_candidates do not exactly preserve the domain candidate records")
+        if freshness["status"] != "fresh":
+            raise BridgeValidationError("daily-interest candidate data requires fresh timestamped context")
+    return value
+
+
+def _extract_decision_input(body: str) -> dict[str, Any]:
+    if not isinstance(body, str) or not body.strip():
+        raise TaskContractError("task body is missing")
+    if len(body.encode("utf-8")) > MAX_TASK_BODY_BYTES:
+        raise TaskContractError("task body exceeds the non-truncating contract limit")
+    marker = "jev_decision_input_json:"
+    if body.count(marker) != 1:
+        raise TaskContractError("jev_decision_input_json marker is missing or ambiguous")
+    tail = body.split(marker, 1)[1].lstrip()
+    try:
+        value, end = json.JSONDecoder().raw_decode(tail)
+    except (json.JSONDecodeError, TypeError):
+        raise TaskContractError("jev_decision_input_json is malformed or truncated")
+    remainder = tail[end:].lstrip()
+    allowed_suffixes = (
+        "-->", "scope_admission_json:", "scope_admission_json=", "approval_record_json:",
+        "acceptance_amendment_json:", "approval_inheritance:", "Route contract", "## Route contract",
+    )
+    if remainder and not remainder.startswith(allowed_suffixes):
+        raise TaskContractError("jev_decision_input_json has unexpected trailing data or is truncated")
+    try:
+        return _validate_decision_input(value)
+    except BridgeValidationError as exc:
+        raise TaskContractError(f"jev_decision_input_json is invalid: {exc}") from exc
+
+
+def _decision_input_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, Mapping):
+        raise BridgeValidationError("decision event must be an object")
+    value = _validate_decision_input(event.get("decision_input"))
+    expected = _decision_input_digest(value)
+    if event.get("decision_input_sha256") != expected:
+        raise BridgeValidationError("decision_input integrity check failed")
+    return value
 
 
 def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
@@ -518,6 +849,57 @@ def _load_current_worker_binding(bridge_root: str | Path | None, profile: str) -
         return None
 
 
+def _terminal_kanban_show_allowed(args: Any, profile_name: str, binding: tuple[str, str] | None, store: BridgeStore) -> bool:
+    """Allow only the native self-task readback after this worker's successful completion."""
+    if binding is None or profile_name == "default":
+        return False
+    task_id, run_id = binding
+    if (not isinstance(task_id, str) or not task_id or not isinstance(run_id, str)
+            or not run_id.isdigit() or int(run_id) <= 0
+            or os.environ.get("HERMES_PROFILE") != profile_name
+            or os.environ.get("HERMES_KANBAN_TASK") != task_id
+            or os.environ.get("HERMES_KANBAN_RUN_ID") != run_id):
+        return False
+    if not isinstance(args, Mapping) or set(args) - {"task_id", "board"}:
+        return False
+    if "task_id" in args and (not isinstance(args["task_id"], str) or args["task_id"] != task_id):
+        return False
+    board = _trusted_current_board()
+    if board is None:
+        return False
+    if "board" in args and (not isinstance(args["board"], str) or args["board"] != board):
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        with kbc.connect_closing(board=board) as conn:
+            task = kb.get_task(conn, task_id)
+            run = kb.get_run(conn, int(run_id))
+            latest = kb.latest_run(conn, task_id)
+        if task is None or run is None or latest is None:
+            return False
+        if (getattr(task, "id", None) != task_id or getattr(task, "status", None) != "done"
+                or getattr(task, "current_run_id", object()) is not None
+                or getattr(task, "assignee", None) != profile_name):
+            return False
+        if (getattr(run, "task_id", None) != task_id or getattr(run, "id", None) != int(run_id)
+                or getattr(run, "profile", None) != profile_name or getattr(run, "status", None) != "done"
+                or getattr(run, "outcome", None) != "completed"):
+            return False
+        ended_at = getattr(run, "ended_at", None)
+        if not isinstance(ended_at, (int, float)) or ended_at <= 0:
+            return False
+        if (getattr(latest, "task_id", None) != task_id or getattr(latest, "id", None) != int(run_id)
+                or getattr(latest, "status", None) != "done" or getattr(latest, "outcome", None) != "completed"):
+            return False
+        if _active_provisional_stop(store, task_id, run_id) is not None:
+            return False
+        return True
+    except Exception:
+        log.warning("Jev terminal kanban_show check failed closed", exc_info=True)
+        return False
+
+
 def _validate_common(raw: Mapping[str, Any], *, task_id: str | None = None) -> tuple[str, str, str, list[str], str, list[str]]:
     event_task = _safe_text(raw.get("task_id") or task_id, "task_id", 128)
     run_id = _safe_text(raw.get("run_id"), "run_id", 128)
@@ -618,6 +1000,10 @@ def _real_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -> d
             raise BridgeValidationError("step evidence_refs must be a short list")
         clean_steps.append({"action": action, "result": result, "evidence_changed": changed, "evidence_refs": [_safe_text(v, "step reference", 300) for v in refs_item]})
     original = _safe_text(raw.get("original_request"), "original_request", 300)
+    root_goal_raw = raw.get("root_goal")
+    local_goal_raw = raw.get("local_goal")
+    root_goal = _bounded_root_goal(root_goal_raw) if root_goal_raw is not None else None
+    local_goal = _safe_text(local_goal_raw, "local_goal", 600) if local_goal_raw is not None else None
     unknown = _safe_text(raw.get("current_unknown"), "current_unknown", 300)
     next_action = _safe_text(raw.get("next_action"), "next_action", 300)
     fingerprint = _safe_text(raw.get("evidence_fingerprint"), "evidence_fingerprint", 128)
@@ -646,19 +1032,40 @@ def _real_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -> d
         "next_action": next_action,
         "evidence_fingerprint": fingerprint,
     }
-    root_goal = raw.get("root_goal")
     if root_goal is not None:
-        if not isinstance(root_goal, str) or not root_goal.strip() or len(root_goal.encode("utf-8")) > 8192:
-            raise BridgeValidationError("root_goal exceeds the 8KiB UTF-8 bound")
         event["root_goal"] = root_goal
-    local_goal = raw.get("local_goal")
     if local_goal is not None:
-        event["local_goal"] = _safe_text(local_goal, "local_goal", 600)
+        event["local_goal"] = local_goal
     goal_ref = raw.get("request_goal_ref_json")
     if goal_ref is not None:
         if not isinstance(goal_ref, Mapping) or not isinstance(goal_ref.get("root_id"), str):
             raise BridgeValidationError("request_goal_ref_json is invalid")
         event["request_goal_ref_json"] = {"root_id": _safe_text(goal_ref["root_id"], "root goal id", 128)}
+    decision_input_raw = raw.get("decision_input")
+    decision_input_digest = raw.get("decision_input_sha256")
+    if decision_input_raw is not None or decision_input_digest is not None:
+        decision_input = _validate_decision_input(decision_input_raw)
+        expected_digest = _decision_input_digest(decision_input)
+        if not isinstance(decision_input_digest, str) or decision_input_digest != expected_digest:
+            raise BridgeValidationError("decision_input integrity check failed")
+        event["decision_input"] = decision_input
+        event["decision_input_sha256"] = expected_digest
+    discovery = raw.get("discovery_context")
+    if discovery is not None:
+        expected = {
+            "before_first_search": {"phase": "before_first_search", "next_action": "web_search", "completion_requested": False, "provenance": "dispatcher_contract_and_worker_hook"},
+            "after_search_source_check": {"phase": "after_search_source_check", "next_action": "web_extract", "completion_requested": False, "provenance": "dispatcher_contract_and_worker_hook"},
+        }
+        phase = discovery.get("phase") if isinstance(discovery, Mapping) else None
+        if (not isinstance(phase, str) or phase not in expected or dict(discovery) != expected[phase]
+                or event["profile"] != "research" or event["source"] != "worker_hook"
+                or event["synthetic"] or not any("web_search" in criterion for criterion in criteria)
+                or any(step["action"] in {"kanban_complete", "kanban_request_review"} for step in clean_steps)
+                or (phase == "before_first_search" and any(step["action"] == "web_search" for step in clean_steps))
+                or (phase == "after_search_source_check" and not any(step["action"] == "web_search" for step in clean_steps)
+                    and tools <= len(clean_steps))):
+            raise BridgeValidationError("discovery context is not a bound research worker checkpoint")
+        event["discovery_context"] = expected[phase]
     target = raw.get("target_session_key")
     if target is not None:
         event["target_session_key"] = _safe_text(target, "target_session_key", 300)
@@ -680,7 +1087,8 @@ def validate_checkpoint(raw: Mapping[str, Any], *, task_id: str | None = None) -
         "category", "profile", "task_id", "run_id", "checkpoint_id", "criteria", "completion_conditions",
         "observation", "recent_steps", "evidence_refs", "completed_tools", "tools_since_previous",
         "changed_evidence", "changed_evidence_age_seconds", "target_session_key", "next_named_milestone", "original_request",
-        "current_unknown", "next_action", "evidence_fingerprint",
+        "current_unknown", "next_action", "evidence_fingerprint", "decision_input", "decision_input_sha256", "discovery_context",
+        "root_goal", "local_goal", "request_goal_ref_json",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -816,10 +1224,15 @@ class TaskContract:
     root_goal: str | None = None
     local_goal: str | None = None
     request_goal_ref_json: Mapping[str, str] | None = None
+    search_authorized: bool = False
+    extract_authorized: bool = False
+    decision_input: dict[str, Any] | None = None
 
 
-def _extract_scope_admission(body: str) -> Mapping[str, Any]:
-    limited = body[:32_000]
+def _extract_scope_admission(body: str, title: str = "") -> Mapping[str, Any]:
+    if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_TASK_BODY_BYTES:
+        raise TaskContractError("task body is missing or exceeds the non-truncating limit")
+    limited = body
     for marker in ("scope_admission_json:", "scope_admission_json="):
         index = limited.find(marker)
         if index < 0:
@@ -828,14 +1241,33 @@ def _extract_scope_admission(body: str) -> Mapping[str, Any]:
         try:
             value, _ = json.JSONDecoder().raw_decode(tail)
         except (json.JSONDecodeError, TypeError):
-            continue
+            raise TaskContractError("scope_admission_json is malformed")
         if isinstance(value, Mapping):
             return value
-    raise TaskContractError("scope_admission_json is not available in task body")
+        raise TaskContractError("scope_admission_json must be an object")
+    # A missing optional marker is not a missing dispatcher binding. Only use
+    # short, explicitly labelled acceptance lines; never forward the full body.
+    criteria = []
+    for line in limited.splitlines():
+        label, separator, value = line.strip().partition(":")
+        if not separator:
+            label, separator, value = line.strip().partition("：")
+        if not separator:
+            label, separator, value = line.strip().partition(";")
+        if label.strip().lower() in {"acceptance", "completion conditions", "完了条件", "受入条件"} and value.strip():
+            criteria.append(_safe_text(value.strip()[:300], "completion condition", 300))
+            if len(criteria) >= MAX_CRITERIA:
+                break
+    return {
+        "outcome_target": _safe_text(title, "task title", 300),
+        "completion_conditions": criteria or ["unknown: explicit completion conditions are unavailable; read back the source task before judging completion"],
+        "decision_points": ["unknown: free-text task criteria require source-task review before completion"],
+        "next_action": "read back the source task before judging completion",
+    }
 
 
-def _request_goal_ref(body: str, bridge_root: str | Path | None) -> tuple[dict[str, str] | None, str | None]:
-    """Resolve an explicit task marker against the configured goal store only."""
+def _request_goal_ref(body: str, bridge_root: str | Path | None, session_id: str | None = None) -> tuple[dict[str, str] | None, str | None]:
+    """Read a task-bound root ID from the body and resolve only the configured store."""
     if not bridge_root:
         return None, None
     marker = "request_goal_ref_json:"
@@ -846,10 +1278,14 @@ def _request_goal_ref(body: str, bridge_root: str | Path | None) -> tuple[dict[s
         ref, _ = json.JSONDecoder().raw_decode(body[index + len(marker):].lstrip())
         if not isinstance(ref, Mapping) or not isinstance(ref.get("root_id"), str):
             return None, None
-        from .request_goals import MAX_GOAL_BYTES, RequestGoalStore
-        root = RequestGoalStore(Path(bridge_root).expanduser() / "request-goals.jsonl").get(ref["root_id"])
+        configured_path = str((Path(bridge_root).expanduser() / "request-goals.jsonl").resolve())
+        from importlib import import_module
+        goals = import_module(f"{__package__}.request_goals")
+        root = goals.RequestGoalStore(configured_path).get(ref["root_id"])
+        if not isinstance(session_id, str) or not session_id.strip() or root.get("identity", {}).get("session_id") != session_id:
+            return None, None
         outcome = root.get("outcome")
-        if not isinstance(outcome, str) or not outcome.strip() or len(outcome.encode("utf-8")) > MAX_GOAL_BYTES:
+        if not isinstance(outcome, str) or not outcome.strip() or len(outcome.encode("utf-8")) > goals.MAX_GOAL_BYTES:
             return None, None
         return {"root_id": ref["root_id"]}, outcome
     except Exception:
@@ -860,6 +1296,15 @@ def _load_dispatcher_contract(bridge_root: str | Path | None = None) -> TaskCont
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if not task_id or not raw_run_id:
+        binding = _load_current_worker_binding(bridge_root, profile)
+        if binding is not None:
+            if task_id and task_id != binding["task_id"]:
+                raise TaskContractError("worker observer binding conflicts with HERMES_KANBAN_TASK")
+            if raw_run_id and raw_run_id != binding["run_id"]:
+                raise TaskContractError("worker observer binding conflicts with HERMES_KANBAN_RUN_ID")
+            task_id = binding["task_id"]
+            raw_run_id = binding["run_id"]
     if not task_id or not raw_run_id or not profile:
         raise TaskContractError("trusted HERMES_KANBAN_TASK/HERMES_KANBAN_RUN_ID/HERMES_PROFILE is missing")
     if not raw_run_id.isdigit() or int(raw_run_id) <= 0:
@@ -881,17 +1326,17 @@ def _load_dispatcher_contract(bridge_root: str | Path | None = None) -> TaskCont
         raise TaskContractError("task/run profile binding does not match trusted worker profile")
     if not isinstance(task.body, str) or not task.body.strip():
         raise TaskContractError("task body is missing")
+    decision_input = _extract_decision_input(task.body)
     admission = _extract_scope_admission(task.body)
-    goal_ref, root_goal = _request_goal_ref(task.body, bridge_root)
+    goal_ref, root_goal = _request_goal_ref(task.body, bridge_root, getattr(task, "session_id", None))
     values = admission.get("completion_conditions")
     if not isinstance(values, list) or not values:
         raise TaskContractError("scope_admission_json.completion_conditions is missing")
     criteria = tuple(_safe_text(value, "completion condition", 300) for value in values[:MAX_CRITERIA] if isinstance(value, str) and value.strip())
     if not criteria:
         raise TaskContractError("completion conditions contain no usable strings")
-    original_value = admission.get("outcome_target") or task.title
-    local_goal = _safe_text(original_value, "local goal", 600)
-    original = root_goal or _safe_text(original_value, "original request", 300)
+    local_goal = _safe_text(admission.get("outcome_target") or task.title, "local goal", 600)
+    original = root_goal or _safe_text(admission.get("outcome_target") or task.title, "original request", 300)
     decision_points = admission.get("decision_points")
     if isinstance(decision_points, list) and decision_points:
         unknown = "; ".join(str(value) for value in decision_points[:4] if isinstance(value, str) and value.strip())
@@ -900,6 +1345,31 @@ def _load_dispatcher_contract(bridge_root: str | Path | None = None) -> TaskCont
         current_unknown = "unknown: task contract does not enumerate remaining decision points"
     next_value = admission.get("next_action") or "read back the remaining completion conditions before completion"
     next_action = _safe_text(next_value, "next action", 300)
+    actions = admission.get("allowed_actions")
+    search_authorized = (
+        profile == "research"
+        and isinstance(actions, list)
+        and any(isinstance(action, str) and ("web_search" in action or "direct web searches" in action.lower()) for action in actions)
+        and any("web_search" in criterion for criterion in criteria)
+    )
+    extract_authorized = (
+        search_authorized and isinstance(actions, list)
+        and any(isinstance(action, str) and "web_extract" in action for action in actions)
+    )
+    if profile == "research":
+        decision_points = decision_input.get("decision_points")
+        usable_points = (
+            [_safe_text(value, "decision point", 64) for value in decision_points[:4]
+             if isinstance(value, str) and value.strip()]
+            if isinstance(decision_points, list) else []
+        )
+        if usable_points:
+            current_unknown = _safe_text(
+                "task-specific decision context: " + "; ".join(usable_points),
+                "current unknown", 300,
+            )
+        elif isinstance(decision_points, list) and decision_points:
+            current_unknown = "unknown: decision points were not readable"
     started_at = run.started_at or task.started_at
     if not isinstance(started_at, (int, float)) or started_at <= 0:
         raise TaskContractError("trusted task/run start time is unavailable")
@@ -916,6 +1386,9 @@ def _load_dispatcher_contract(bridge_root: str | Path | None = None) -> TaskCont
         root_goal=root_goal,
         local_goal=local_goal if root_goal is not None else None,
         request_goal_ref_json=goal_ref,
+        search_authorized=search_authorized,
+        extract_authorized=extract_authorized,
+        decision_input=decision_input,
     )
 
 
@@ -947,6 +1420,17 @@ class Producer:
         if binding is None:
             return None
         task_id, run_id = binding
+        if tool_name == "kanban_show" and _terminal_kanban_show_allowed(args, self.profile_name, binding, self.store):
+            return None
+        try:
+            contract = self.contract_loader()
+            if (contract.profile != self.profile_name or contract.task_id != task_id
+                    or str(contract.run_id) != str(run_id)):
+                raise TaskContractError("trusted task/run binding mismatch")
+            _validate_decision_input(contract.decision_input)
+        except Exception:
+            log.warning("Jev structured decision input is unavailable or invalid; blocking tool=%s", tool_name)
+            return {"action": "block", "message": "BLOCKED: Jev structured decision input is missing or invalid; no tool call permitted."}
         try:
             active = _active_provisional_stop(self.store, task_id, run_id)
         except Exception:
@@ -959,9 +1443,18 @@ class Producer:
         if tool_name == "kanban_block":
             self_binding = _self_block_binding(self.profile_name, self.bridge_root, binding)
             if self_binding is not None and _kanban_block_args_match(args, self_binding):
-                # Returning None preserves the native tool's schema, task/run,
-                # board, and permission checks; this hook grants no board access.
+                # Preserve the native self-report path; the native tool keeps
+                # its own task, board, and permission checks.
                 return None
+        try:
+            contract = self.contract_loader()
+            if (contract.profile != self.profile_name or contract.task_id != task_id
+                    or str(contract.run_id) != str(run_id)):
+                raise TaskContractError("trusted task/run binding mismatch")
+            _validate_decision_input(contract.decision_input)
+        except Exception:
+            log.warning("Jev structured decision input is unavailable or invalid; blocking tool=%s", tool_name)
+            return {"action": "block", "message": "BLOCKED: Jev structured decision input is missing or invalid; no tool call permitted."}
         return {"action": "block", "message": PROVISIONAL_STOP_BLOCK_MESSAGE}
 
     def _diagnostic(self, reason: str, contract: TaskContract | None = None, *, detail: str = "") -> None:
@@ -1007,6 +1500,10 @@ class Producer:
             "steps": [],
             "last_checkpoint_at": last_at or contract.started_at,
             "checkpoint_count": len(events),
+            # A reattached producer cannot prove what happened before it loaded.
+            "history_complete": not events,
+            "search_seen": False,
+            "completion_requested": False,
         }
         self._states[key] = state
         return state
@@ -1040,6 +1537,8 @@ class Producer:
             "steps": state["steps"],
             "refs": refs,
             "changed": state["changed"],
+            "discovery_pending": bool(contract.search_authorized and state["history_complete"] and not state["completion_requested"]),
+            "source_check_authorized": bool(contract.extract_authorized and state["search_seen"]),
         }
         fingerprint = hashlib.sha256(_json(fingerprint_source).encode("utf-8")).hexdigest()[:24]
         checkpoint_id = f"cp-{int(state['total_tools'])}-{fingerprint[:12]}"
@@ -1073,7 +1572,13 @@ class Producer:
             "current_unknown": contract.current_unknown,
             "next_action": contract.next_action,
             "evidence_fingerprint": fingerprint,
+            "decision_input": _validate_decision_input(contract.decision_input),
+            "decision_input_sha256": _decision_input_digest(_validate_decision_input(contract.decision_input)),
         }
+        if contract.search_authorized and state["history_complete"] and not state["search_seen"] and not state["completion_requested"]:
+            raw["discovery_context"] = {"phase": "before_first_search", "next_action": "web_search", "completion_requested": False, "provenance": "dispatcher_contract_and_worker_hook"}
+        elif contract.extract_authorized and state["history_complete"] and state["search_seen"] and not state["completion_requested"]:
+            raw["discovery_context"] = {"phase": "after_search_source_check", "next_action": "web_extract", "completion_requested": False, "provenance": "dispatcher_contract_and_worker_hook"}
         return _real_checkpoint(raw, task_id=contract.task_id) | {"state": "pending", "created_at": _iso_from_epoch(now), "producer_profile": self.profile_name}
 
     def _persist_if_due(self, contract: TaskContract, state: dict[str, Any], now: float) -> None:
@@ -1117,6 +1622,10 @@ class Producer:
             state = self._state(contract)
             state["total_tools"] += 1
             state["tools_since"] += 1
+            if tool_name == "web_search":
+                state["search_seen"] = True
+            if tool_name in {"kanban_complete", "kanban_request_review"}:
+                state["completion_requested"] = True
             state["changed"] = bool(state["changed"] or projection["evidence_changed"])
             step = {
                 "action": _safe_text(tool_name, "step action", 96),
@@ -1151,7 +1660,7 @@ def _point_snapshot_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
     """Project one bounded event into the opt-in point-state contract."""
     steps = event.get("recent_steps")
     latest = steps[-1] if isinstance(steps, list) and steps else None
-    return {
+    snapshot = {
         "goal": event.get("original_request", ""),
         "scope": event.get("criteria", []),
         "next_named_milestone": _point_state_milestone(event),
@@ -1162,6 +1671,11 @@ def _point_snapshot_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "next_named_verification": event.get("next_named_verification"),
         "correction_instruction": event.get("correction_instruction"),
     }
+    if event.get("discovery_context") is not None:
+        clean = _real_checkpoint(event, task_id=event.get("task_id"))
+        snapshot["discovery_context"] = clean["discovery_context"]
+        snapshot["expected_next_action"] = clean["discovery_context"]["next_action"]
+    return snapshot
 
 
 def _point_snapshot_from_request(request_body: Mapping[str, Any]) -> dict[str, Any]:
@@ -1200,9 +1714,20 @@ def build_jev_request(event: Mapping[str, Any], *, model: str = MODEL, point_sta
     """Build the bounded structural projection shared by both providers."""
     if not _event_projection_is_eligible(event):
         raise BridgeValidationError("event projection is not eligible")
+    decision_input = _decision_input_from_event(event)
     model_name = _safe_text(model, "model", 128)
     if point_state_enabled:
         request = build_point_state_request(_point_snapshot_from_event(event))
+        try:
+            point_state = json.loads(request["state"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BridgeValidationError("point-state request projection is malformed") from exc
+        if not isinstance(point_state, dict):
+            raise BridgeValidationError("point-state request projection is not an object")
+        point_state["decision_input"] = decision_input
+        request["state"] = _json(point_state)
+        if len(request["state"].encode("utf-8")) > MAX_EVENT_BYTES:
+            raise BridgeValidationError("point-state request exceeds the inline event limit")
         request["model"] = model_name
         return request
     steps = event.get("recent_steps")
@@ -1229,6 +1754,7 @@ def build_jev_request(event: Mapping[str, Any], *, model: str = MODEL, point_sta
         "remaining_unknowns": event["current_unknown"],
         "next_action": event["next_action"],
         "evidence_refs": event["evidence_refs"],
+        "decision_input": decision_input,
     }
     state_json = _json(state)
     if len(state_json.encode("utf-8")) > MAX_EVENT_BYTES:
@@ -1453,6 +1979,156 @@ def request_decision_with_fallback(
     _lifecycle_log("result_returned", route, correlation_id, destination="caller_decision_return", status="validated")
     return decision
 
+def _sufficiency_integer(value: Any, name: str, *, maximum: int = MAX_SUFFICIENCY_COUNT) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        raise BridgeValidationError(f"{name} must be an integer from 0 to {maximum}")
+    return value
+
+
+def validate_sufficiency_snapshot(raw: Any) -> dict[str, Any]:
+    """Accept only the approved aggregate news-snapshot fields; no article text."""
+    if not isinstance(raw, Mapping):
+        raise BridgeValidationError("snapshot must be an object")
+    if any(not isinstance(key, str) for key in raw):
+        raise BridgeValidationError("snapshot keys must be strings")
+    missing = sorted(SUFFICIENCY_SNAPSHOT_FIELDS - set(raw))
+    unknown = sorted(set(raw) - SUFFICIENCY_SNAPSHOT_FIELDS)
+    if missing or unknown:
+        raise BridgeValidationError("snapshot fields do not match the strict aggregate allowlist")
+    try:
+        packed = json.dumps(dict(raw), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeError):
+        raise BridgeValidationError("snapshot is not strict JSON")
+    if len(packed.encode("utf-8")) > MAX_SUFFICIENCY_INPUT_BYTES:
+        raise BridgeValidationError("snapshot exceeds the aggregate input byte limit")
+    if raw.get("snapshot_version") != NEWS_DOMAIN_EXTENSION:
+        raise BridgeValidationError("snapshot_version is unsupported")
+
+    calls_used = _sufficiency_integer(raw.get("broad_search_calls_used"), "broad_search_calls_used", maximum=NEWS_BROAD_SEARCH_CALL_CAP)
+    call_cap = _sufficiency_integer(raw.get("broad_search_call_cap"), "broad_search_call_cap", maximum=NEWS_BROAD_SEARCH_CALL_CAP)
+    if call_cap != NEWS_BROAD_SEARCH_CALL_CAP or calls_used > call_cap:
+        raise BridgeValidationError("broad search call cap does not match the existing three-call safeguard")
+    total = _sufficiency_integer(raw.get("total_verified_eligible_candidate_count"), "total_verified_eligible_candidate_count")
+    required_count = _sufficiency_integer(raw.get("required_non_ai_communication_count"), "required_non_ai_communication_count")
+    required_met = raw.get("required_non_ai_communication_condition_met")
+    if not isinstance(required_met, bool):
+        raise BridgeValidationError("required_non_ai_communication_condition_met must be boolean")
+
+    by_category = raw.get("verified_counts_by_broad_category")
+    if not isinstance(by_category, Mapping) or len(by_category) > MAX_SUFFICIENCY_CATEGORIES:
+        raise BridgeValidationError("verified_counts_by_broad_category must be a bounded object")
+    clean_categories: dict[str, int] = {}
+    for category, count in by_category.items():
+        if not isinstance(category, str) or not SUFFICIENCY_CATEGORIES_PATTERN.fullmatch(category):
+            raise BridgeValidationError("broad category names must be short lowercase category codes")
+        clean_categories[category] = _sufficiency_integer(count, f"category {category}")
+        if clean_categories[category] > total:
+            raise BridgeValidationError("a broad category count cannot exceed the verified candidate total")
+
+    unresolved = {
+        "unresolved_freshness_check_count": _sufficiency_integer(raw.get("unresolved_freshness_check_count"), "unresolved_freshness_check_count"),
+        "unresolved_source_check_count": _sufficiency_integer(raw.get("unresolved_source_check_count"), "unresolved_source_check_count"),
+        "unresolved_dedup_check_count": _sufficiency_integer(raw.get("unresolved_dedup_check_count"), "unresolved_dedup_check_count"),
+    }
+    coverage = raw.get("coverage_status")
+    if not isinstance(coverage, str) or coverage not in {"complete", "incomplete", "unknown"}:
+        raise BridgeValidationError("coverage_status must be complete, incomplete, or unknown")
+    no_gain = _sufficiency_integer(raw.get("consecutive_no_gain_count"), "consecutive_no_gain_count", maximum=NEWS_CONSECUTIVE_NO_GAIN_STOP)
+    if no_gain > calls_used:
+        raise BridgeValidationError("consecutive_no_gain_count cannot exceed broad_search_calls_used")
+
+    return {
+        "snapshot_version": NEWS_DOMAIN_EXTENSION,
+        "broad_search_calls_used": calls_used,
+        "broad_search_call_cap": call_cap,
+        "total_verified_eligible_candidate_count": total,
+        "verified_counts_by_broad_category": dict(sorted(clean_categories.items())),
+        "required_non_ai_communication_count": required_count,
+        "required_non_ai_communication_condition_met": required_met,
+        **unresolved,
+        "coverage_status": coverage,
+        "consecutive_no_gain_count": no_gain,
+    }
+
+
+def _sufficiency_precondition(snapshot: Mapping[str, Any]) -> dict[str, str] | None:
+    """Keep deterministic completeness, mix, and search-stop rules ahead of Jev."""
+    if snapshot["coverage_status"] != "complete":
+        return {"status": "more_evidence_needed", "reason_code": "coverage_incomplete"}
+    if any(snapshot[key] for key in (
+        "unresolved_freshness_check_count", "unresolved_source_check_count", "unresolved_dedup_check_count",
+    )):
+        return {"status": "more_evidence_needed", "reason_code": "unresolved_checks"}
+    if snapshot["total_verified_eligible_candidate_count"] and not snapshot["required_non_ai_communication_condition_met"]:
+        return {"status": "more_evidence_needed", "reason_code": "required_mix_missing"}
+    if (
+        snapshot["total_verified_eligible_candidate_count"] == 0
+        and snapshot["broad_search_calls_used"] < NEWS_BROAD_SEARCH_CALL_CAP
+        and snapshot["consecutive_no_gain_count"] < NEWS_CONSECUTIVE_NO_GAIN_STOP
+    ):
+        return {"status": "more_evidence_needed", "reason_code": "search_not_exhausted"}
+    return None
+
+
+def build_jev_sufficiency_request(snapshot: Mapping[str, Any], *, model: str = TYPESAFE_MODEL) -> dict[str, Any]:
+    """Build a provider request whose state contains only approved aggregates."""
+    clean = validate_sufficiency_snapshot(snapshot)
+    criteria = {choice: outcome[2] for choice, outcome in SUFFICIENCY_CHOICES.items()}
+    instructions = (
+        "Return an advisory about aggregate snapshot sufficiency only. Do not choose or rank articles, "
+        "search, write copy, authorize publication, or change worker authority. The cron's deterministic "
+        "search and editorial rules remain authoritative; this answer alone never authorizes stopping. "
+        "Use snapshot_sufficient only when the supplied complete aggregate is internally consistent. "
+        "The required non-AI/communication count is the existing minimum; its boolean says whether the rule is met when qualifying items exist. "
+        "For an empty candidate set, the existing three-call cap or two-consecutive-no-gain stop must be met. "
+        "If uncertain, choose a more_evidence option; never infer completeness from missing data."
+    )
+    return {
+        "model": _safe_text(model, "model", 128),
+        "state": _json(clean),
+        "questions": {
+            "news_sufficiency": {
+                "type": "choice",
+                "instructions": instructions,
+                "criteria": criteria,
+            }
+        },
+    }
+
+
+def parse_jev_sufficiency_response(value: Any, *, transport: str | None = None) -> dict[str, str]:
+    """Reduce provider output to the two-field advisory contract or reject it."""
+    del transport
+    try:
+        answer = value["answers"]["news_sufficiency"]
+        choice = answer["choice"]
+        probabilities = answer["probabilities"]
+        confidence = answer["confidence"]
+        if choice not in SUFFICIENCY_CHOICES or not isinstance(probabilities, Mapping) or set(probabilities) != set(SUFFICIENCY_CHOICES):
+            raise ValueError
+        for probability in probabilities.values():
+            if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+                raise ValueError
+            numeric = Decimal(str(probability))
+            if not numeric.is_finite() or numeric < 0 or numeric > 1:
+                raise ValueError
+        probability_sum = sum((Decimal(str(item)) for item in probabilities.values()), Decimal("0"))
+        selected_probability = Decimal(str(probabilities[choice]))
+        if abs(probability_sum - Decimal("1")) > Decimal("0.01"):
+            return {"status": "more_evidence_needed", "reason_code": "provider_ambiguous"}
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ValueError
+        certainty = Decimal(str(confidence))
+        if not certainty.is_finite() or certainty < 0 or certainty > 1:
+            raise ValueError
+        threshold = Decimal(str(SUFFICIENCY_CONFIDENCE_THRESHOLD))
+        if certainty < threshold or selected_probability < threshold:
+            return {"status": "more_evidence_needed", "reason_code": "provider_ambiguous"}
+        status, reason_code, _description = SUFFICIENCY_CHOICES[choice]
+        return {"status": status, "reason_code": reason_code}
+    except (KeyError, TypeError, ValueError, OverflowError, InvalidOperation):
+        raise JevRequestError("malformed_response")
+
 
 def _configured_provider(ctx: Any, prefix: str, default: ProviderSpec) -> ProviderSpec:
     """Read provider routing settings without ever reading a credential value."""
@@ -1479,6 +2155,292 @@ def _configured_timeout(ctx: Any) -> float:
     if not 0 < timeout <= 120:
         raise JevRequestError("configuration_invalid")
     return timeout
+
+
+class _SufficiencyAlreadyChecked(RuntimeError):
+    """Raised when this plugin process already attempted a live evaluation."""
+
+
+_SUFFICIENCY_LIVE_CALL_LOCK = threading.Lock()
+_sufficiency_live_call_used = False
+
+
+def _sufficiency_live_call_already_used() -> bool:
+    with _SUFFICIENCY_LIVE_CALL_LOCK:
+        return _sufficiency_live_call_used
+
+
+def _claim_sufficiency_live_call() -> None:
+    global _sufficiency_live_call_used
+    with _SUFFICIENCY_LIVE_CALL_LOCK:
+        if _sufficiency_live_call_used:
+            raise _SufficiencyAlreadyChecked
+        _sufficiency_live_call_used = True
+
+
+def jev_sufficiency_tool(args: Any, *, ctx: Any, post_fn: Callable[[ProviderSpec, Mapping[str, Any], float], Any] | None = None) -> str:
+    """Return an advisory only; provider failure never authorizes or blocks publication."""
+    if _sufficiency_live_call_already_used():
+        return _json({"status": "more_evidence_needed", "reason_code": "already_checked"})
+    try:
+        snapshot = validate_sufficiency_snapshot(args)
+    except (BridgeValidationError, TypeError, ValueError):
+        return _json({"status": "invalid_snapshot", "reason_code": "invalid_input"})
+    precondition = _sufficiency_precondition(snapshot)
+    if precondition is not None:
+        return _json(precondition)
+    sender = post_fn or _post_provider
+    request_id = _new_lifecycle_id()
+    evaluation_started = False
+
+    def guarded_sender(spec: ProviderSpec, body: Mapping[str, Any], timeout: float) -> Any:
+        nonlocal evaluation_started
+        if not evaluation_started:
+            _claim_sufficiency_live_call()
+            evaluation_started = True
+        return sender(spec, body, timeout)
+
+    try:
+        primary = _configured_provider(ctx, "primary", PRIMARY_PROVIDER)
+        fallback = _configured_provider(ctx, "fallback", FALLBACK_PROVIDER)
+        timeout = _configured_timeout(ctx)
+        request = build_jev_sufficiency_request(snapshot, model=primary.model)
+        decision = request_decision_with_fallback(
+            request,
+            primary=primary,
+            fallback=fallback,
+            timeout=timeout,
+            post_fn=guarded_sender,
+            parser=parse_jev_sufficiency_response,
+            route="jev.search_sufficiency", request_id=request_id,
+        )
+    except _SufficiencyAlreadyChecked:
+        return _json({"status": "more_evidence_needed", "reason_code": "already_checked"})
+    except JevRequestError as exc:
+        reason_code = "provider_ambiguous" if exc.reason == "malformed_response" else "provider_unavailable"
+        return _json({"status": "more_evidence_needed", "reason_code": reason_code})
+    except Exception:
+        # Fail to the direct-search owner; do not expose provider/error payloads.
+        return _json({"status": "more_evidence_needed", "reason_code": "provider_ambiguous"})
+    status = decision.get("status") if isinstance(decision, Mapping) else None
+    reason_code = decision.get("reason_code") if isinstance(decision, Mapping) else None
+    if status not in SUFFICIENCY_STATUSES or reason_code not in SUFFICIENCY_REASON_CODES:
+        return _json({"status": "more_evidence_needed", "reason_code": "provider_ambiguous"})
+    _lifecycle_log("delivered", "jev.search_sufficiency", request_id, destination="jev_sufficiency_tool_result", status="supplied")
+    return _json({"status": status, "reason_code": reason_code})
+
+
+def _validate_search_advice_terms(raw: Any, name: str) -> list[str]:
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_SEARCH_ADVICE_TERMS_PER_GROUP:
+        raise BridgeValidationError(f"{name} must contain 1..{MAX_SEARCH_ADVICE_TERMS_PER_GROUP} exact terms")
+    terms: list[str] = []
+    for item in raw:
+        term = _safe_text(item, name, MAX_SEARCH_ADVICE_TERM_CHARS)
+        if re.search(r"https?://|www\.|^@", term, re.IGNORECASE):
+            raise BridgeValidationError(f"{name} cannot contain URLs or author handles")
+        if term in terms:
+            raise BridgeValidationError(f"{name} cannot contain duplicate terms")
+        terms.append(term)
+    return terms
+
+
+def validate_search_advice_candidates(raw: Any) -> dict[str, Any]:
+    """Accept only bounded public entity/name/number tokens for search advice."""
+    allowed = {"snapshot_version", "candidates"}
+    if not isinstance(raw, Mapping) or set(raw) != allowed:
+        raise BridgeValidationError("search-advice input fields do not match the strict allowlist")
+    if raw.get("snapshot_version") != NEWS_SEARCH_ADVICE_EXTENSION:
+        raise BridgeValidationError("search-advice snapshot_version is unsupported")
+    candidates = raw.get("candidates")
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= MAX_SEARCH_ADVICE_CANDIDATES:
+        raise BridgeValidationError("candidates must contain 1..8 entries")
+    clean: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping) or set(candidate) != {"candidate_id", "entity_terms", "number_terms", "name_terms"}:
+            raise BridgeValidationError("candidate fields do not match the strict token allowlist")
+        candidate_id = _safe_text(candidate.get("candidate_id"), "candidate_id", 2)
+        if not SEARCH_ADVICE_CANDIDATE_ID_PATTERN.fullmatch(candidate_id) or candidate_id in seen:
+            raise BridgeValidationError("candidate_id must be a unique local id c1..c8")
+        seen.add(candidate_id)
+        entities = _validate_search_advice_terms(candidate.get("entity_terms"), "entity_terms")
+        numbers = candidate.get("number_terms", [])
+        names = candidate.get("name_terms", [])
+        if not isinstance(numbers, list) or len(numbers) > MAX_SEARCH_ADVICE_TERMS_PER_GROUP:
+            raise BridgeValidationError("number_terms must be a bounded list")
+        if not isinstance(names, list) or len(names) > MAX_SEARCH_ADVICE_TERMS_PER_GROUP:
+            raise BridgeValidationError("name_terms must be a bounded list")
+        clean_numbers = [_safe_text(item, "number_terms", MAX_SEARCH_ADVICE_TERM_CHARS) for item in numbers]
+        clean_names = [_safe_text(item, "name_terms", MAX_SEARCH_ADVICE_TERM_CHARS) for item in names]
+        all_terms = entities + clean_numbers + clean_names
+        if len(all_terms) < 2 or len(set(all_terms)) != len(all_terms):
+            raise BridgeValidationError("each candidate must have at least two distinct exact terms")
+        if any(re.search(r"https?://|www\.|^@", item, re.IGNORECASE) for item in clean_numbers + clean_names):
+            raise BridgeValidationError("terms cannot contain URLs or author handles")
+        clean.append({
+            "candidate_id": candidate_id,
+            "entity_terms": entities,
+            "number_terms": clean_numbers,
+            "name_terms": clean_names,
+        })
+    packed = json.dumps({"snapshot_version": NEWS_SEARCH_ADVICE_EXTENSION, "candidates": clean}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(packed.encode("utf-8")) > MAX_SEARCH_ADVICE_INPUT_BYTES:
+        raise BridgeValidationError("search-advice input exceeds its byte limit")
+    return {"snapshot_version": NEWS_SEARCH_ADVICE_EXTENSION, "candidates": clean}
+
+
+def _search_advice_query(candidate: Mapping[str, Any]) -> str:
+    terms = candidate["entity_terms"] + candidate["number_terms"] + candidate["name_terms"]
+    return " ".join(json.dumps(term, ensure_ascii=False) for term in terms)
+
+
+def _search_advice_choices(candidates: list[Mapping[str, Any]]) -> dict[str, str]:
+    choices = {
+        f"candidate_{candidate['candidate_id']}": (
+            "Prioritize this candidate for Web verification using its exact entity, numeric, and name terms: "
+            + ", ".join(candidate["entity_terms"] + candidate["number_terms"] + candidate["name_terms"])
+        )
+        for candidate in candidates
+    }
+    choices["no_preference"] = "The bounded terms do not support a confident priority choice; use the deterministic local fallback."
+    return choices
+
+
+def build_jev_search_advice_request(value: Mapping[str, Any], *, model: str = TYPESAFE_MODEL) -> dict[str, Any]:
+    clean = validate_search_advice_candidates(value)
+    choices = _search_advice_choices(clean["candidates"])
+    state = {
+        "snapshot_version": NEWS_SEARCH_ADVICE_EXTENSION,
+        "candidates": [
+            {
+                "candidate_id": item["candidate_id"],
+                "entity_terms": item["entity_terms"],
+                "number_terms": item["number_terms"],
+                "name_terms": item["name_terms"],
+                "exact_query": _search_advice_query(item),
+            }
+            for item in clean["candidates"]
+        ],
+    }
+    return {
+        "model": _safe_text(model, "model", 128),
+        "state": _json(state),
+        "questions": {
+            "news_search_priority": {
+                "type": "choice",
+                "instructions": (
+                    "Choose one candidate to search first based only on which supplied exact terms form the most specific, "
+                    "testable news lead. Do not assess truth, source reliability, account quality, publication eligibility, "
+                    "or decide whether to publish. Do not invent or rewrite terms. If uncertain, choose no_preference. "
+                    "The curator constructs and executes the exact query and retains all normal Web verification rules."
+                ),
+                "criteria": choices,
+            }
+        },
+    }
+
+
+def parse_jev_search_advice_response(value: Any, candidate_ids: set[str], *, transport: str | None = None) -> str | None:
+    del transport
+    try:
+        answer = value["answers"]["news_search_priority"]
+        choice = answer["choice"]
+        probabilities = answer["probabilities"]
+        confidence = answer["confidence"]
+        allowed = {f"candidate_{candidate_id}" for candidate_id in candidate_ids} | {"no_preference"}
+        if choice not in allowed or not isinstance(probabilities, Mapping) or set(probabilities) != allowed:
+            raise ValueError
+        values = []
+        for probability in probabilities.values():
+            if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+                raise ValueError
+            number = Decimal(str(probability))
+            if not number.is_finite() or number < 0 or number > 1:
+                raise ValueError
+            values.append(number)
+        if abs(sum(values, Decimal("0")) - Decimal("1")) > Decimal("0.01"):
+            return None
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ValueError
+        certainty = Decimal(str(confidence))
+        if not certainty.is_finite() or certainty < SEARCH_ADVICE_CONFIDENCE_THRESHOLD:
+            return None
+        if Decimal(str(probabilities[choice])) < SEARCH_ADVICE_CONFIDENCE_THRESHOLD or choice == "no_preference":
+            return None
+        return choice.removeprefix("candidate_")
+    except (KeyError, TypeError, ValueError, OverflowError, InvalidOperation):
+        raise JevRequestError("malformed_response")
+
+
+_SEARCH_ADVICE_LIVE_CALL_LOCK = threading.Lock()
+_search_advice_live_call_used = False
+
+
+def _search_advice_live_call_already_used() -> bool:
+    with _SEARCH_ADVICE_LIVE_CALL_LOCK:
+        return _search_advice_live_call_used
+
+
+def _claim_search_advice_live_call() -> None:
+    global _search_advice_live_call_used
+    with _SEARCH_ADVICE_LIVE_CALL_LOCK:
+        if _search_advice_live_call_used:
+            raise _SufficiencyAlreadyChecked
+        _search_advice_live_call_used = True
+
+
+def jev_search_advice_tool(args: Any, *, ctx: Any, post_fn: Callable[[ProviderSpec, Mapping[str, Any], float], Any] | None = None) -> str:
+    """Select an X-lead ID only; exact search text is composed locally from approved tokens."""
+    try:
+        clean = validate_search_advice_candidates(args)
+    except (BridgeValidationError, TypeError, ValueError):
+        return _json({"status": "invalid_input", "reason_code": "invalid_input"})
+    candidates = clean["candidates"]
+    fallback = candidates[0]
+    selected = fallback
+    selection_source = "local_fallback"
+    request_id = _new_lifecycle_id()
+    if not _search_advice_live_call_already_used():
+        sender = post_fn or _post_provider
+        evaluation_started = False
+
+        def guarded_sender(spec: ProviderSpec, body: Mapping[str, Any], timeout: float) -> Any:
+            nonlocal evaluation_started
+            if not evaluation_started:
+                _claim_search_advice_live_call()
+                evaluation_started = True
+            return sender(spec, body, timeout)
+
+        try:
+            primary = _configured_provider(ctx, "primary", PRIMARY_PROVIDER)
+            secondary = _configured_provider(ctx, "fallback", FALLBACK_PROVIDER)
+            timeout = _configured_timeout(ctx)
+            request = build_jev_search_advice_request(clean, model=primary.model)
+            candidate_ids = {item["candidate_id"] for item in candidates}
+            chosen_id = request_decision_with_fallback(
+                request,
+                primary=primary,
+                fallback=secondary,
+                timeout=timeout,
+                post_fn=guarded_sender,
+                parser=lambda response, transport=None: parse_jev_search_advice_response(response, candidate_ids, transport=transport),
+                route="jev.search_advice", request_id=request_id,
+            )
+            match = next((item for item in candidates if item["candidate_id"] == chosen_id), None)
+            if match is not None:
+                selected = match
+                selection_source = "jev_advisory"
+        except Exception:
+            # Advisory failure falls back locally; it never drops the X lead.
+            pass
+    _lifecycle_log("delivered", "jev.search_advice", request_id, destination="jev_search_advice_tool_result", status=selection_source)
+    return _json({
+        "status": "query_advice_ready",
+        "selection_source": selection_source,
+        "candidate_id": selected["candidate_id"],
+        "search_query": _search_advice_query(selected),
+        "exact_fallback_query": _search_advice_query(fallback),
+    })
 
 
 def _cost(usage: Any) -> Decimal:
@@ -1841,12 +2803,12 @@ def build_default_scope_request(
     checkpoint_id = _safe_text(trigger.get("checkpoint_id"), "default scope checkpoint_id", 128)
     original_request = _safe_text(trigger.get("original_request"), "default scope original_request", 300)
     root_goal = trigger.get("root_goal")
-    if root_goal is not None:
-        root_goal = _safe_text(root_goal, "default scope root_goal", 300)
     local_goal = trigger.get("local_goal")
+    goal_ref = trigger.get("request_goal_ref_json")
+    if root_goal is not None:
+        root_goal = _bounded_root_goal(root_goal)
     if local_goal is not None:
         local_goal = _safe_text(local_goal, "default scope local_goal", 600)
-    goal_ref = trigger.get("request_goal_ref_json")
     if goal_ref is not None and (not isinstance(goal_ref, Mapping) or not isinstance(goal_ref.get("root_id"), str)):
         raise BridgeValidationError("default scope request_goal_ref_json is invalid")
     conditions = trigger.get("completion_conditions")
@@ -1929,12 +2891,12 @@ def build_default_scope_request(
         "session_hash": _identity_hash(session_identity),
         "turn_hash": _identity_hash(turn_identity) if turn_identity else "",
         "original_request": original_request,
-        "completion_conditions": clean_conditions,
-        "purpose_context": purpose_context,
         "root_goal": root_goal,
         "local_goal": local_goal,
         "request_goal_ref_json": {"root_id": _safe_text(goal_ref["root_id"], "root goal id", 128)} if goal_ref else None,
-        "confirmed_request_goal": root_goal or "unknown: no host-confirmed request root",
+        "confirmed_request_goal": root_goal,
+        "completion_conditions": clean_conditions,
+        "purpose_context": purpose_context,
         "current_action": clean_action,
         "expected_next_action": expected_next,
         "remaining_unknowns": current_unknown,
@@ -2281,9 +3243,6 @@ class DefaultScopeGuard:
             "original_request": _safe_text(contract.get("original_request"), "default scope original_request", 300),
             "completion_conditions": list(contract.get("completion_conditions", [])),
             "purpose_projection": dict(contract.get("purpose_projection", {})) if isinstance(contract.get("purpose_projection"), Mapping) else {},
-            "root_goal": contract.get("root_goal"),
-            "local_goal": contract.get("local_goal"),
-            "request_goal_ref_json": contract.get("request_goal_ref_json"),
             "observed_actions": [dict(action)],
             "evidence_refs": list(contract.get("evidence_refs", [])),
             "worker_conclusion": {"status": "unmeasured", "reason": "default scope screen has no worker conclusion"},
@@ -2488,6 +3447,7 @@ class DefaultScopeGuard:
                         if trigger.get("scope") == "default_scope" and not any(row.get("trigger_id") == trigger.get("trigger_id") for row in self.store.triggers()):
                             self.store.append_trigger(trigger)
                         self.consumer._append_control_locked(trigger, "provisional_stop", source="default_scope", reason="default action may exceed the admitted scope", scope="default")
+                _lifecycle_log("delivered", "jev.default_scope.purpose+legacy_scope", correlation_id, destination="pre_tool_call_block_result", status="supplied")
                 return {"action": "block", "message": _default_scope_advisory_message(action, label=str(label), confidence=confidence, reason=reason)}
             if self._candidate(decision):
                 # Low-confidence and unknown-confidence scope drift are advisory
@@ -2747,6 +3707,11 @@ class Consumer:
     def _eligible(self, event: Mapping[str, Any]) -> bool:
         if not _event_projection_is_eligible(event):
             return False
+        if event.get("schema_version") == SCHEMA_VERSION:
+            try:
+                _decision_input_from_event(event)
+            except (BridgeValidationError, TypeError, ValueError):
+                return False
         latest = self._latest_ledger()
         event_key = event.get("event_key")
         existing = latest.get(event_key)
@@ -2859,7 +3824,7 @@ class Consumer:
 
     @staticmethod
     def _point_state_trigger_category(state: str, effect: ControlEffect) -> str | None:
-        """Only acceptance readiness or an independent guard creates a hold."""
+        """Only acceptance readiness or an independent guard creates a stop trigger."""
         if effect.reason == "guard_precedence":
             return "scope_drift"
         if state == "acceptance_ready" and effect.action == "review":
@@ -3156,6 +4121,79 @@ def _schema() -> dict[str, Any]:
     }
 
 
+def _sufficiency_tool_schema() -> dict[str, Any]:
+    """Strict model-facing schema for aggregate-only news sufficiency checks."""
+    count = {"type": "integer", "minimum": 0, "maximum": MAX_SUFFICIENCY_COUNT}
+    return {
+        "name": "jev_sufficiency",
+        "description": (
+            "Ask Jev for an aggregate-only news-search sufficiency advisory. Pass only the defined counts and flags; "
+            "never pass candidate titles, URLs, excerpts, posts, logs, reaction data, or personal-interest text. "
+            "This tool cannot search, rank candidates, write copy, authorize publication, or override the cron's direct-search safeguards."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "snapshot_version": {"type": "string", "enum": [NEWS_DOMAIN_EXTENSION]},
+                "broad_search_calls_used": {"type": "integer", "minimum": 0, "maximum": NEWS_BROAD_SEARCH_CALL_CAP},
+                "broad_search_call_cap": {"type": "integer", "enum": [NEWS_BROAD_SEARCH_CALL_CAP]},
+                "total_verified_eligible_candidate_count": count,
+                "verified_counts_by_broad_category": {
+                    "type": "object",
+                    "additionalProperties": count,
+                    "description": "At most 24 short lowercase category codes mapped to verified counts; category counts may overlap but each must not exceed the total.",
+                },
+                "required_non_ai_communication_count": count,
+                "required_non_ai_communication_condition_met": {"type": "boolean"},
+                "unresolved_freshness_check_count": count,
+                "unresolved_source_check_count": count,
+                "unresolved_dedup_check_count": count,
+                "coverage_status": {"type": "string", "enum": ["complete", "incomplete", "unknown"]},
+                "consecutive_no_gain_count": {"type": "integer", "minimum": 0, "maximum": NEWS_CONSECUTIVE_NO_GAIN_STOP},
+            },
+            "required": sorted(SUFFICIENCY_SNAPSHOT_FIELDS),
+            "additionalProperties": False,
+        },
+    }
+
+
+def _search_advice_tool_schema() -> dict[str, Any]:
+    term = {"type": "string", "minLength": 1, "maxLength": MAX_SEARCH_ADVICE_TERM_CHARS}
+    terms = {"type": "array", "items": term, "maxItems": MAX_SEARCH_ADVICE_TERMS_PER_GROUP}
+    return {
+        "name": "jev_search_advice",
+        "description": (
+            "Ask Jev to prioritize which X-discovered candidate to search first. Pass only local candidate IDs and exact public entity, "
+            "number/currency, product, or plan terms. Never pass post text, URLs, author handles, reactions, or personal-interest notes. "
+            "Jev only selects a candidate ID; the host composes the exact Web query locally and retains all verification and publication rules."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "snapshot_version": {"type": "string", "enum": [NEWS_SEARCH_ADVICE_EXTENSION]},
+                "candidates": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_SEARCH_ADVICE_CANDIDATES,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "candidate_id": {"type": "string", "pattern": "^c[1-8]$"},
+                            "entity_terms": {"type": "array", "items": term, "minItems": 1, "maxItems": MAX_SEARCH_ADVICE_TERMS_PER_GROUP},
+                            "number_terms": terms,
+                            "name_terms": terms,
+                        },
+                        "required": ["candidate_id", "entity_terms", "number_terms", "name_terms"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["snapshot_version", "candidates"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def _config_value(ctx: Any, key: str, default: Any = None) -> Any:
     try:
         return ctx.get_config(key, default)
@@ -3178,11 +4216,11 @@ def _profile_list(value: Any) -> set[str]:
     return set()
 
 
-def register(ctx: Any) -> DefaultScopeGuard | None:
+def register(ctx: Any) -> None:
     root = _config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
     if not root:
         log.warning("jev-route-screening disabled: bridge_dir is not configured")
-        return None
+        return
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _config_value(ctx, "role", "")
     producer_profiles = _profile_list(_config_value(ctx, "producer_profiles", []))
@@ -3225,10 +4263,23 @@ def register(ctx: Any) -> DefaultScopeGuard | None:
             handler=consumer.review_tool,
             description="Inspect Jev stops and record an explicit default readback decision.",
         )
+        ctx.register_tool(
+            name="jev_sufficiency",
+            toolset="jev_sufficiency",
+            schema=_sufficiency_tool_schema(),
+            handler=lambda args, **kwargs: jev_sufficiency_tool(args, ctx=ctx),
+            description="Check aggregate news-snapshot sufficiency; advisory only, with direct-search rules remaining authoritative.",
+        )
+        ctx.register_tool(
+            name="jev_search_advice",
+            toolset="jev_search_advice",
+            schema=_search_advice_tool_schema(),
+            handler=lambda args, **kwargs: jev_search_advice_tool(args, ctx=ctx),
+            description="Select which exact-term X lead to search first; the host builds the query and verifies sources.",
+        )
         ctx.register_hook("pre_llm_call", scope_guard.pre_llm_call)
         ctx.register_hook("pre_tool_call", scope_guard.pre_tool_call)
         ctx.register_hook("post_tool_call", consumer.post_tool_call)
         return scope_guard
     else:
         log.info("jev-route-screening disabled for unconfigured profile=%s role=%s", profile or "unknown", role or "unknown")
-        return None

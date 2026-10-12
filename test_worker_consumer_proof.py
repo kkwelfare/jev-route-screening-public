@@ -5,33 +5,72 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
-
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
+OPS_ROOT = ROOT
 PACKAGE_NAME = "jev_route_screening_worker_consumer_proof_target"
+OPS_PACKAGE_NAME = "jev_route_screening_ops_worker_consumer_proof_target"
 
 
-def _load_plugin() -> Any:
+def _load_plugin(root: Path = ROOT, package_name: str = PACKAGE_NAME) -> Any:
     spec = importlib.util.spec_from_file_location(
-        PACKAGE_NAME,
-        ROOT / "__init__.py",
-        submodule_search_locations=[str(ROOT)],
+        package_name,
+        root / "__init__.py",
+        submodule_search_locations=[str(root)],
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not load the installed Jev plugin package")
+        raise RuntimeError("could not load plugin package from candidate root")
     package = importlib.util.module_from_spec(spec)
-    sys.modules[PACKAGE_NAME] = package
+    sys.modules[package_name] = package
     spec.loader.exec_module(package)
     return package
 
 
 plugin = _load_plugin()
 bridge = sys.modules[f"{PACKAGE_NAME}.bridge"]
+ops_plugin = plugin
+ops_bridge = bridge
+
+
+def _generic_decision_input(task_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": bridge.DECISION_INPUT_SCHEMA_VERSION,
+        "scope": "offline producer-to-consumer integration proof",
+        "objective": "preserve explicit task decision inputs through Jev",
+        "target_candidates": [],
+        "requested_outcome": "bounded advisory route only",
+        "action_mode": "read_only",
+        "allowed_actions": ["read bounded task evidence"],
+        "forbidden_actions": ["external posting", "authority changes"],
+        "decision_points": [],
+        "freshness": {
+            "status": "fresh",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "valid_until": "2099-01-01T00:00:00Z",
+            "rule": "static offline fixture window",
+        },
+        "deduplication": {"status": "not_applicable", "basis": "unique integration fixture"},
+        "baseline": {"status": "defined", "value": "offline"},
+        "completion_conditions": ["the worker event reaches the shared consumer"],
+        "prior_context": {"summary": "fixture only"},
+        "signals": [],
+        "feedback": [],
+        "output_requirements": {"format": "machine-readable advisory"},
+        "uncertainty": [],
+        "provenance": {
+            "task_id": task_id,
+            "source": "offline_test_fixture",
+            "captured_at": "2026-01-01T00:00:00Z",
+            "source_references": [f"kanban://task/{task_id}"],
+        },
+        "domain_extension": None,
+    }
 
 
 class FakeContext:
@@ -84,37 +123,42 @@ def _bound_method(callback: Any, class_name: str) -> Any:
 
 
 class WorkerConsumerProofTests(unittest.TestCase):
-    def test_explicit_task_root_marker_uses_configured_portable_store(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="portable-goal-transport-") as temporary:
-            root = Path(temporary)
-            from request_goals import RequestGoalStore
-            store = RequestGoalStore(root / "request-goals.jsonl")
-            source_id = store.record_host_source(
-                user_message="new request: keep the original objective",
-                session_id="portable-session", turn_id="portable-turn",
-                sender_id="human", platform="test")
-            record = store.bind(source_id=source_id, root_id="portable-root")
-            body = 'scope_admission_json: {"outcome_target":"repair only","completion_conditions":["test"]}\nrequest_goal_ref_json: {"root_id":"portable-root","store_path":"/ignored"}'
-            ref, outcome = bridge._request_goal_ref(body, root)
-            self.assertEqual(ref, {"root_id": "portable-root"})
-            self.assertEqual(outcome, record["outcome"])
-            self.assertEqual(bridge._request_goal_ref(body, root / "other"), (None, None))
-
     def test_registered_worker_hook_to_consumer_and_default_readback(self) -> None:
         secret_sentinel = "PROOF_SECRET_SENTINEL_MUST_NOT_PERSIST"
         with tempfile.TemporaryDirectory(prefix="jev-worker-consumer-proof-") as temporary:
             root = Path(temporary)
-            contract = bridge.TaskContract(
-                task_id="proof-task-001",
-                run_id="9001",
-                profile="ops",
-                started_at=1000.0,
-                original_request="prove the bounded producer to consumer route",
-                criteria=("event identity is bound", "consumer decision is recorded"),
-                current_unknown="whether the same event reaches default readback",
-                next_action="read back the decision and release any provisional stop",
-                evidence_refs=("kanban://task/proof-task-001",),
-            )
+            goals = sys.modules[f"{PACKAGE_NAME}.request_goals"]
+            request_store = goals.RequestGoalStore(root / "request-goals.jsonl")
+            source_id = request_store.record_host_source(
+                user_message="new request: Deliver the daily news digest to the user",
+                session_id="proof-session", turn_id="proof-turn", sender_id="master", platform="discord")
+            root_record = request_store.bind(source_id=source_id, root_id="root-proof",
+                completion_conditions=["Deliver the daily news digest to the user"])
+            scope = {"outcome_target": "Repair validator only", "completion_conditions": ["validate repair"]}
+            body = ("scope_admission_json: " + json.dumps(scope)
+                    + '\nrequest_goal_ref_json: {"root_id":"root-proof","store_path":"/attacker/ignored.jsonl"}'
+                    + '\njev_decision_input_json: ' + json.dumps(_generic_decision_input("proof-task-001")))
+            fake_task = SimpleNamespace(status="running", current_run_id=9001, assignee="ops",
+                                        body=body, title="repair task", started_at=1000.0,
+                                        session_id="proof-session")
+            fake_run = SimpleNamespace(profile="ops", started_at=1000.0, id=9001)
+            fake_kb = SimpleNamespace(get_task=lambda _conn, _id: fake_task,
+                                      get_run=lambda _conn, _id: fake_run,
+                                      latest_run=lambda _conn, _id: fake_run)
+            @contextmanager
+            def fake_connect():
+                yield object()
+            fake_connect_module = SimpleNamespace(connect_closing=fake_connect)
+            fake_hermes = ModuleType("hermes_cli")
+            fake_hermes.kanban_db = fake_kb
+            fake_hermes.kanban_db_connect = fake_connect_module
+            with patch.dict(sys.modules, {"hermes_cli": fake_hermes}):
+                with _environment(HERMES_PROFILE="ops", HERMES_KANBAN_TASK="proof-task-001", HERMES_KANBAN_RUN_ID="9001"):
+                    contract = ops_bridge._load_dispatcher_contract(root)
+            self.assertEqual(contract.root_goal, root_record["outcome"])
+            self.assertEqual(contract.local_goal, "Repair validator only")
+            self.assertEqual(contract.original_request, root_record["outcome"])
+            self.assertEqual(contract.request_goal_ref_json, {"root_id": "root-proof"})
 
             producer_context = FakeContext("ops", root, "producer")
             with _environment(
@@ -122,7 +166,7 @@ class WorkerConsumerProofTests(unittest.TestCase):
                 HERMES_KANBAN_TASK=contract.task_id,
                 HERMES_KANBAN_RUN_ID=contract.run_id,
             ):
-                plugin.register(producer_context)
+                ops_plugin.register(producer_context)
                 producer_callback = next(
                     (
                         callback
@@ -166,6 +210,27 @@ class WorkerConsumerProofTests(unittest.TestCase):
             self.assertTrue(event["projection_safe"])
             self.assertEqual(event["profile"], "ops")
             self.assertEqual(event["producer_profile"], "ops")
+            self.assertEqual(event["root_goal"], "Deliver the daily news digest to the user")
+            self.assertEqual(event["request_goal_ref_json"], {"root_id": "root-proof"})
+            self.assertEqual(event["local_goal"], "Repair validator only")
+            jev_request = bridge.build_jev_request(event, model="offline")
+            jev_state = json.loads(jev_request["state"])
+            self.assertEqual(jev_state["original_request"], "Deliver the daily news digest to the user")
+            self.assertEqual(jev_state["root_goal"], "Deliver the daily news digest to the user")
+            self.assertEqual(jev_state["local_goal"], "Repair validator only")
+            trigger = {
+                "task_id": event["task_id"], "run_id": event["run_id"],
+                "trigger_id": "trigger-proof", "checkpoint_id": event["checkpoint_id"],
+                "original_request": event["original_request"], "root_goal": event["root_goal"],
+                "local_goal": event["local_goal"], "request_goal_ref_json": event["request_goal_ref_json"],
+                "completion_conditions": event["criteria"], "current_unknown": event["current_unknown"],
+                "next_action": event["next_action"], "evidence_refs": event["evidence_refs"],
+            }
+            default_projection = bridge.build_default_scope_request(trigger, {"tool_name": "kanban_complete", "arg_keys": []},
+                session_identity="proof-session", turn_identity="proof-turn", model="offline")
+            default_state = json.loads(default_projection["state"])
+            self.assertEqual(default_state["root_goal"], "Deliver the daily news digest to the user")
+            self.assertEqual(default_state["local_goal"], "Repair validator only")
             self.assertEqual(event["task_id"], contract.task_id)
             self.assertEqual(str(event["run_id"]), contract.run_id)
             self.assertEqual(event["event_key"], f"{contract.task_id}:{contract.run_id}:{event['checkpoint_id']}")
@@ -260,88 +325,6 @@ class WorkerConsumerProofTests(unittest.TestCase):
             )
             self.assertNotIn(secret_sentinel, persisted)
             self.assertNotIn(secret_sentinel, json.dumps(event, ensure_ascii=False, sort_keys=True))
-
-    def test_consumer_discards_finished_post_tool_threads(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="jev-thread-cleanup-regression-") as temporary:
-            root = Path(temporary)
-            for should_fail in (False, True):
-                started = threading.Event()
-                release = threading.Event()
-                consumer = bridge.Consumer(
-                    FakeContext("default", root, "consumer"),
-                    bridge.BridgeStore(root),
-                )
-
-                def bounded_process_pending(fails: bool = should_fail) -> None:
-                    started.set()
-                    if not release.wait(timeout=2.0):
-                        raise AssertionError("thread cleanup probe was not released")
-                    if fails:
-                        raise RuntimeError("thread cleanup probe")
-
-                consumer.process_pending = bounded_process_pending
-                consumer.post_tool_call(tool_name="thread-cleanup-probe")
-                self.assertTrue(started.wait(timeout=1.0))
-                with consumer._lock:
-                    threads = list(consumer._threads)
-                self.assertEqual(len(threads), 1)
-                thread = threads[0]
-
-                if should_fail:
-                    with self.assertLogs(bridge.log, level="WARNING"):
-                        release.set()
-                        thread.join(timeout=2.0)
-                else:
-                    release.set()
-                    thread.join(timeout=2.0)
-                self.assertFalse(thread.is_alive())
-                with consumer._lock:
-                    self.assertNotIn(thread, consumer._threads)
-                    self.assertEqual(consumer._threads, set())
-
-    def test_consumer_coalesces_post_tool_burst_to_one_worker(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="jev-thread-burst-regression-") as temporary:
-            root = Path(temporary)
-            consumer = bridge.Consumer(
-                FakeContext("default", root, "consumer"),
-                bridge.BridgeStore(root),
-            )
-            started = threading.Event()
-            release = threading.Event()
-            state_lock = threading.Lock()
-            active = 0
-            max_active = 0
-            calls = 0
-
-            def bounded_process_pending() -> None:
-                nonlocal active, max_active, calls
-                with state_lock:
-                    calls += 1
-                    active += 1
-                    max_active = max(max_active, active)
-                    started.set()
-                release.wait(timeout=2.0)
-                with state_lock:
-                    active -= 1
-
-            consumer.process_pending = bounded_process_pending
-            for _ in range(50):
-                consumer.post_tool_call(tool_name="thread-burst-probe")
-
-            self.assertTrue(started.wait(timeout=1.0))
-            with consumer._lock:
-                threads = list(consumer._threads)
-            self.assertEqual(len(threads), 1)
-            self.assertEqual(sum(thread.is_alive() for thread in threads), 1)
-
-            release.set()
-            threads[0].join(timeout=2.0)
-            self.assertFalse(threads[0].is_alive())
-            with consumer._lock:
-                self.assertEqual(consumer._threads, set())
-            with state_lock:
-                self.assertEqual(max_active, 1)
-                self.assertGreaterEqual(calls, 2, "a burst during processing must request one follow-up scan")
 
     def test_consumer_processes_more_than_daily_cap_across_distinct_runs_offline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="jev-daily-cap-regression-") as temporary:

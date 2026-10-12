@@ -80,9 +80,13 @@ class SelfBlockTests(unittest.TestCase):
 
     def test_own_native_report_preserves_stop(self):
         self.stop()
-        before = self.store.controls()
-        for args in ({'reason': 'need input'}, {'reason': 'need input', 'task_id': 't_fixture', 'board': 'default', 'kind': 'needs_input'}):
-            self.assertIsNone(self.hook(tool_name='kanban_block', args=args))
+        contract = SimpleNamespace(profile='ops', task_id='t_fixture', run_id='321', decision_input={})
+        with patch.object(self.bridge, '_load_dispatcher_contract', return_value=contract), patch.object(
+            self.bridge, '_validate_decision_input', return_value={}
+        ):
+            before = self.store.controls()
+            for args in ({'reason': 'need input'}, {'reason': 'need input', 'task_id': 't_fixture', 'board': 'default', 'kind': 'needs_input'}):
+                self.assertIsNone(self.hook(tool_name='kanban_block', args=args))
         self.assertEqual(self.store.controls(), before)
 
     def test_other_tools_and_malformed_arguments_denied(self):
@@ -113,7 +117,10 @@ class SelfBlockTests(unittest.TestCase):
 
     def test_no_stop_does_not_read_strict_identity(self):
         with patch.object(self.bridge, '_load_current_worker_binding', side_effect=OSError('unavailable')):
-            self.assertIsNone(self.hook(tool_name='terminal', args={'command': 'true'}))
+            with patch.object(self.bridge, '_load_dispatcher_contract', return_value=SimpleNamespace(
+                profile='ops', task_id='t_fixture', run_id='321', decision_input={}
+            )), patch.object(self.bridge, '_validate_decision_input', return_value={}):
+                self.assertIsNone(self.hook(tool_name='terminal', args={'command': 'true'}))
         self.live.assert_not_called()
 
     def test_control_read_failure_denied(self):

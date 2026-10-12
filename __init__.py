@@ -7,8 +7,8 @@ from pathlib import Path
 
 from . import bridge as _bridge
 from . import purpose_background as _purpose_background
-from .skill_router import TargetedReadingAdvisor
 from . import request_goals as _request_goals
+from .skill_router import TargetedReadingAdvisor
 
 
 def _profile_list(value):
@@ -25,7 +25,7 @@ def _record_worker_spawned_binding(ctx, **kwargs):
     if dispatcher_profile not in {"", "default"}:
         return
     assignee = str(kwargs.get("assignee") or "").strip()
-    producer_profiles = _profile_list(_bridge._config_value(ctx, "producer_profiles", [])) or {"ops"}
+    producer_profiles = _profile_list(_bridge._config_value(ctx, "producer_profiles", [])) or {"ops", "docs", "research", "intl", "archivist"}
     if assignee not in producer_profiles:
         return
     root = _bridge._config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
@@ -52,50 +52,33 @@ def _record_worker_spawned_binding(ctx, **kwargs):
 
 
 def register(ctx):
-    """Register existing behavior and any explicitly enabled default add-on."""
+    """Register the existing checkpoint bridge and default reading advisory."""
     scope_guard = _bridge.register(ctx)
-    # Request-goal tools are core bridge behavior, independent of optional reading.
     profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
     role = _bridge._config_value(ctx, "role", "")
     consumers = _profile_list(_bridge._config_value(ctx, "consumer_profiles", []))
     if not role and profile == "default":
         role, consumers = "consumer", {"default"}
-    root = _bridge._config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
-    if role == "consumer" and profile == "default" and profile in consumers and root:
-        goal_store = _request_goals.RequestGoalStore(Path(root) / "request-goals.jsonl")
-        _request_goals.register_request_goal_route(ctx, goal_store)
-        if scope_guard is not None:
-            advisor = _purpose_background.PurposeBackgroundAdvisor(ctx, scope_guard, goal_store)
-            ctx.register_hook("post_llm_call", advisor.post_llm_call)
-            ctx.register_hook("pre_llm_call", advisor.pre_llm_call)
-    profile = str(getattr(ctx, "profile_name", "") or os.environ.get("HERMES_PROFILE", "")).strip()
-    role = _bridge._config_value(ctx, "role", "")
-    consumers = _profile_list(_bridge._config_value(ctx, "consumer_profiles", []))
-    if not role and profile == "default":
-        role, consumers = "consumer", {"default"}
-
-    if (
-        profile == "default"
-        and role == "consumer"
-        and profile in consumers
-        and _bridge._config_value(ctx, "task_input_staging_enabled", False) is True
-    ):
-        from .task_input_staging import register_task_input_staging
-
-        register_task_input_staging(ctx)
-
     if role != "consumer" or profile != "default" or profile not in consumers:
         return
     root = _bridge._config_value(ctx, "bridge_dir", "") or os.environ.get("HERMES_JEV_BRIDGE_DIR", "")
     if not root:
         return
+    if _bridge._config_value(ctx, "task_input_staging_enabled", False) is True:
+        from .task_input_staging import register_task_input_staging
+
+        register_task_input_staging(ctx)
     ctx.register_hook("on_kanban_worker_spawned", lambda **kwargs: _record_worker_spawned_binding(ctx, **kwargs))
+    goal_store = _request_goals.RequestGoalStore(Path(root) / "request-goals.jsonl")
+    _request_goals.register_request_goal_route(ctx, goal_store)
     advisor = TargetedReadingAdvisor(ctx, _bridge.BridgeStore(root), profile_name=profile)
-    if not advisor.enabled:
-        return
-    ctx.register_hook("pre_llm_call", advisor.pre_llm_call)
-    ctx.register_hook("post_tool_call", advisor.post_tool_call)
-    ctx.register_hook("transform_tool_result", advisor.transform_tool_result)
+    if advisor.enabled:
+        ctx.register_hook("pre_llm_call", advisor.pre_llm_call)
+        ctx.register_hook("post_tool_call", advisor.post_tool_call)
+        ctx.register_hook("transform_tool_result", advisor.transform_tool_result)
+    background = _purpose_background.PurposeBackgroundAdvisor(ctx, scope_guard, goal_store)
+    ctx.register_hook("post_llm_call", background.post_llm_call)
+    ctx.register_hook("pre_llm_call", background.pre_llm_call)
 
 
 __all__ = ["TargetedReadingAdvisor", "register"]

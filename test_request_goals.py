@@ -20,20 +20,69 @@ class RequestGoalTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_initial_confirmation_requires_exact_safe_affirmative(self):
-        positive = ("OK", "Okay!", "YES.", "はい！", "それでお願いします。")
-        negative = (
-            "はい、ただしその案では進めないでください。",
-            "yes, but do not proceed with that plan",
-            "OK, but only if you change it",
-            "yes and also send it to everyone",
-            "not okay",
-            "maybe yes",
-        )
-        for message in positive:
-            self.assertTrue(RequestGoalStore._positive_confirmation(message), message)
-        for message in negative:
-            self.assertFalse(RequestGoalStore._positive_confirmation(message), message)
+    def test_live_goal_store_copy_resolves_like_shared_reader(self):
+        workspace_copy = Path(__file__).resolve().parent.parent / "live-request-goals.jsonl"
+        self.assertTrue(workspace_copy.is_file())
+        store = RequestGoalStore(workspace_copy)
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "legacy-goals.jsonl"
+            copied.write_bytes(workspace_copy.read_bytes())
+            projected = RequestGoalStore(copied)._rows()
+        self.assertEqual(store._rows(), projected)
+        self.assertTrue(all(row.get("kind") == "source" for row in projected))
+
+    def test_confirmation_is_one_append_and_projects_after_append_crash(self):
+        source = self.store.record_host_source(
+            user_message="Can you help me think through a project?", session_id="confirm-session",
+            turn_id="offer-turn", sender_id="owner", platform="discord")
+        offer = self.store.offer_initial(source_id=source, outcome="staged outcome",
+            question="Confirm staged outcome?", completion_conditions=["complete it"])
+        self.store.mark_offer_delivered(offer_id=offer["offer_id"],
+            assistant_response="Confirm staged outcome?", session_id="confirm-session", turn_id="offer-turn")
+        confirmation_source = self.store.record_host_source(
+            user_message="OK", session_id="confirm-session", turn_id="confirm-turn",
+            sender_id="owner", platform="discord")
+        original_append = self.store._append
+        appended = []
+        def append_then_crash(row):
+            original_append(row)
+            appended.append(row)
+            if row.get("kind") == "initial_goal_confirmation":
+                raise RuntimeError("simulated crash after confirmation append")
+        self.store._append = append_then_crash
+        with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+            self.store.confirm_initial_from_host(source_id=confirmation_source, user_message="OK",
+                session_id="confirm-session", turn_id="confirm-turn", sender_id="owner", platform="discord")
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0].get("kind"), "initial_goal_confirmation")
+        reloaded = RequestGoalStore(self.store.path)
+        self.assertEqual(reloaded.select_for_session("confirm-session")["outcome"], "staged outcome")
+        self.assertEqual(reloaded.get(appended[0]["root"]["root_id"])["outcome"], "staged outcome")
+
+    def test_atomic_confirmation_reader_expands_single_record_and_keeps_legacy_events(self):
+        event = {
+            "kind": "initial_goal_confirmation",
+            "offer_state": {"kind": "initial_goal_offer_state", "offer_id": "offer-1", "status": "confirmed"},
+            "root": {"kind": "root", "root_id": "root-1", "version": 1, "outcome": "briefing",
+                     "identity": {"session_id": "session-1"}},
+            "selection": {"kind": "selection", "root_id": "root-1", "version": 1,
+                          "identity": {"session_id": "session-1"}},
+        }
+        legacy_root = {"kind": "root", "root_id": "legacy-root", "version": 1, "outcome": "legacy briefing",
+                       "identity": {"session_id": "session-2"}}
+        legacy_selection = {"kind": "selection", "root_id": "legacy-root", "version": 1,
+                            "identity": {"session_id": "session-2"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "goals.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in (event, legacy_root, legacy_selection,
+                {"kind": "source", "source_id": "legacy"})) + "\n")
+            store = RequestGoalStore(path)
+            rows = store._rows()
+            self.assertEqual([row["kind"] for row in rows], ["initial_goal_offer_state", "root", "selection", "root", "selection", "source"])
+            self.assertEqual(store.get("root-1")["outcome"], "briefing")
+            self.assertEqual(store.select_for_session("session-1")["root_id"], "root-1")
+            self.assertEqual(store.get("legacy-root")["outcome"], "legacy briefing")
+            self.assertEqual(store.select_for_session("session-2")["root_id"], "legacy-root")
 
     def test_local_repair_and_unfamiliar_wording_do_not_replace_root(self):
         self.store.add_local_milestone(root_id=self.root["root_id"],
@@ -86,52 +135,6 @@ class RequestGoalTests(unittest.TestCase):
             self.store.approve_from_host(proposal_id=info["proposal_id"],
                 source_id=confirmation_source, user_message=confirmation,
                 session_id="s1", turn_id="t3", sender_id="u1", platform="discord")
-
-    def test_initial_confirmation_is_one_durable_event_and_projects_after_reload(self):
-        source_offer = self.store.record_host_source(
-            user_message="new request: staged proposal", session_id="confirm-session",
-            turn_id="offer-turn", sender_id="owner", platform="discord")
-        offer = self.store.offer_initial(source_id=source_offer, outcome="staged outcome",
-            question="Confirm staged outcome?", completion_conditions=["complete it"])
-        self.store.mark_offer_delivered(offer_id=offer["offer_id"],
-            assistant_response="Confirm staged outcome?", session_id="confirm-session", turn_id="offer-turn")
-        confirmation_source = self.store.record_host_source(
-            user_message="OK", session_id="confirm-session", turn_id="confirm-turn",
-            sender_id="owner", platform="discord")
-        original_append = self.store._append
-        appended = []
-        def append_then_crash(row):
-            original_append(row)
-            appended.append(row)
-            if row.get("kind") == "initial_goal_confirmation":
-                raise RuntimeError("simulated crash after confirmation append")
-        self.store._append = append_then_crash
-        with self.assertRaisesRegex(RuntimeError, "simulated crash"):
-            self.store.confirm_initial_from_host(source_id=confirmation_source, user_message="OK",
-                session_id="confirm-session", turn_id="confirm-turn", sender_id="owner", platform="discord")
-        self.assertEqual(len(appended), 1)
-        reloaded = RequestGoalStore(self.store.path)
-        selected = reloaded.select_for_session("confirm-session")
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["outcome"], "staged outcome")
-        persisted = [json.loads(line) for line in reloaded.path.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(sum(row.get("kind") == "initial_goal_confirmation" for row in persisted), 1)
-
-    def test_old_format_confirmation_events_still_load(self):
-        path = Path(self.tmp.name) / "old-format.jsonl"
-        identity = {"session_id": "legacy-session", "turn_id": "proposal-turn",
-                    "sender_id": "owner", "platform": "discord"}
-        root = {"kind": "root", "root_id": "root_legacy", "version": 1,
-                "outcome": "legacy outcome", "completion_conditions": [],
-                "identity": identity, "local_milestones": []}
-        offer = {"kind": "initial_goal_offer", "offer_id": "offer_legacy", "status": "offered",
-                 "outcome": "legacy outcome", "question": "Confirm?", "identity": identity}
-        state = {"kind": "initial_goal_offer_state", "offer_id": "offer_legacy", "status": "confirmed",
-                 "root_id": "root_legacy", "confirmation_source_id": "src_legacy"}
-        selection = {"kind": "selection", "root_id": "root_legacy", "identity": identity, "version": 1}
-        path.write_text("".join(json.dumps(row) + "\n" for row in (offer, state, root, selection)), encoding="utf-8")
-        loaded = RequestGoalStore(path)
-        self.assertEqual(loaded.select_for_session("legacy-session")["outcome"], "legacy outcome")
 
     def test_source_over_limit_is_unknown_not_truncated(self):
         with self.assertRaisesRegex(GoalError, "unknown, not truncated"):

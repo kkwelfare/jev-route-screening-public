@@ -117,19 +117,36 @@ def build_point_state_request(snapshot: Mapping[str, Any], *, model: str = DEFAU
         "latest_bounded_result": snapshot.get("latest_bounded_result"),
         "refs": snapshot.get("refs", []),
     }
+    discovery = snapshot.get("discovery_context")
+    if discovery is not None:
+        bounded_snapshot["discovery_context"] = discovery
     criteria = {label: STATE_DEFINITIONS[label] for label in POINT_STATES}
     priority = " > ".join(STATE_PRIORITY)
+    discovery_instruction = (" If discovery_context is present, the task has an explicitly authorized research action before completion; missing final candidate evidence is not yet a current-milestone blocker. Do not ignore input or authorization problems." if discovery is not None else "")
     return {
         "model": model,
         "state": _canonical_json(bounded_snapshot),
         "questions": {
             "next_action_state": {
                 "type": "choice",
-                "instructions": f"Classify only the current bounded point and choose exactly one label. Apply this exclusive priority order: {priority}. Acceptance precedes ordinary action; do not grant authority or infer readiness from preparation advancing.",
+                "instructions": f"Classify only the current bounded point and choose exactly one label. Apply this exclusive priority order: {priority}. Acceptance precedes ordinary action; do not grant authority or infer readiness from preparation advancing.{discovery_instruction}",
                 "criteria": criteria,
             }
         },
     }
+
+
+
+def _authorized_discovery_action(snapshot: Mapping[str, Any]) -> Optional[str]:
+    """Use only the validated producer projection, never free-form task prose."""
+    discovery = snapshot.get("discovery_context")
+    if not isinstance(discovery, Mapping):
+        return None
+    for phase, action in (("before_first_search", "web_search"), ("after_search_source_check", "web_extract")):
+        expected = {"phase": phase, "next_action": action, "completion_requested": False, "provenance": "dispatcher_contract_and_worker_hook"}
+        if dict(discovery) == expected and snapshot.get("expected_next_action") == action:
+            return action
+    return None
 
 
 @dataclass(frozen=True)
@@ -341,7 +358,7 @@ class PointStatePolicy:
 
         if not decision.accepted:
             # An uncertain classifier result is not an independently supplied
-            # guard. Continue only within the existing authorized scope; it
+            # guard.  Continue only within the existing authorized scope; it
             # cannot create a stop or establish readiness/completion.
             effect = ControlEffect(
                 "continue_scoped_action",
@@ -376,8 +393,8 @@ class PointStatePolicy:
         if state == "acceptance_ready":
             effect = ControlEffect("review", True, "default_acceptance_review", identity, completion_allowed=False)
         elif state == "scope_or_authorization_blocked":
-            # A classifier label alone is advisory, not independent proof of a
-            # scope or authorization violation. Trusted guards above prevail.
+            # The classification is advisory, not independent proof of a scope
+            # or authorization violation. Trusted guards above retain precedence.
             effect = ControlEffect(
                 "continue_scoped_action",
                 True,
@@ -401,16 +418,31 @@ class PointStatePolicy:
                 instruction = str(snapshot.get("correction_instruction") or snapshot.get("expected_next_action") or "Revalidate the actual bounded input against the current contract, then request default review.")
                 effect = ControlEffect(action, True, "first_unrepaired_error", identity, instructions=(instruction,))
         elif state == "evidence_missing":
-            effect = ControlEffect(
-                "continue_scoped_action",
-                True,
-                "evidence_missing",
-                identity,
-                instructions=(
-                    "Continue gathering only evidence named by the existing admitted task scope; do not infer completion.",
-                ),
-                completion_allowed=False,
-            )
+            next_action = _authorized_discovery_action(snapshot) if issue == "worker_checkpoint" else None
+            if next_action is not None:
+                reason = "research_discovery_pending" if next_action == "web_search" else "research_source_check_pending"
+                effect = ControlEffect(
+                    "continue_scoped_action",
+                    True,
+                    reason,
+                    identity,
+                    instructions=(f"Proceed only with the authorized {next_action}; do not declare completion.",),
+                    completion_allowed=False,
+                )
+            else:
+                # Missing evidence is a reason to keep gathering evidence, not
+                # a Jev-created provisional stop. Independent scope/auth guards
+                # are evaluated above and retain precedence.
+                effect = ControlEffect(
+                    "continue_scoped_action",
+                    True,
+                    "evidence_missing",
+                    identity,
+                    instructions=(
+                        "Continue gathering only evidence named by the existing admitted task scope; do not infer completion.",
+                    ),
+                    completion_allowed=False,
+                )
         elif state == "named_verification_ready":
             verification_name = snapshot.get("next_named_verification") or snapshot.get("named_verification")
             if not isinstance(verification_name, str) or not verification_name.strip():
