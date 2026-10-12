@@ -1,5 +1,29 @@
 # Jev route screening
 
+## Public quick start
+
+**What it is:** An experimental Hermes Agent plugin for bounded Jev worker checkpoints, route advisories, and related opt-in tools.
+**Who it is for:** Hermes operators testing the documented Jev producer/consumer integrations.
+**Requirements:** A Hermes Agent host that supports the hooks in `plugin.yaml`; no Hermes/Python compatibility range is declared. Provider-backed paths read `TYPESAFE_API_KEY` and may fall back to `OPENROUTER_API_KEY`. They can send bounded request text and selected structured context to the configured external provider; see the data-flow and privacy boundaries below.
+
+```sh
+hermes plugins install kkwelfare/jev-route-screening-public --no-enable
+hermes plugins enable jev-route-screening
+```
+
+**Minimal setup:** for a consumer, enable the plugin and set `plugins.entries.jev-route-screening.settings.bridge_dir` to a private local directory; use `role: consumer` and enable only the advisory settings you intend to use. See [Installation and configuration](#installation-and-configuration) for the complete example and opt-in controls.
+
+**Minimal checkpoint input** for `jev_bridge_checkpoint` (example fields must reflect the active task; the example is illustrative only):
+
+```json
+{"schema_version":2,"category":"worker_checkpoint","sensitive":false,"projection_safe":true,"projection_version":1,"task_id":"<current-task-id>","run_id":"<current-run-id>","checkpoint_id":"<checkpoint-id>","criteria":["<accepted criterion>"],"profile":"<active-profile>","source":"worker_hook","original_request":"<short request summary>","observation":"<observed progress>","current_unknown":"<unresolved fact or none>","next_action":"<next bounded step>","recent_steps":[{"action":"<completed action>","result":"<observed result>","evidence_changed":true,"evidence_refs":[]}],"evidence_refs":[],"completed_tools":3,"tools_since_previous":3,"changed_evidence":true,"changed_evidence_age_seconds":120,"evidence_fingerprint":"<observed evidence fingerprint>"}
+```
+
+Use the actual current task/run identifiers and observed facts; the plugin does not create evidence from this example.
+
+License: [MIT](LICENSE).
+
+
 This repository contains the public source candidate for the Jev route-screening Hermes plugin. It includes the selected bridge/router implementation, the plugin manifest (version 0.4.1), and bounded offline tests. It is intentionally experimental; this candidate patch creates no tag or release and does not configure an installed Hermes runtime. The repository is licensed under the MIT License; production use remains a separate decision.
 
 ## Request-scoped upper objectives
