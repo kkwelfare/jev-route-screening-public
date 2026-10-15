@@ -2946,11 +2946,13 @@ class DefaultScopeGuard:
         *,
         decision_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         process_pending: Callable[[], Any] | None = None,
+        has_pending: Callable[[], bool] | None = None,
     ) -> None:
         self.ctx = ctx
         self.store = store
         self.decision_fn = decision_fn or self._decision
         self.process_pending = process_pending
+        self.has_pending = has_pending
         self.consumer: Consumer | None = None
         configured = _config_value(ctx, "default_scope.enabled", True)
         self.enabled = not (isinstance(configured, str) and configured.strip().lower() in {"0", "false", "no", "off"}) and configured is not False
@@ -3367,7 +3369,11 @@ class DefaultScopeGuard:
         # calls with no worker event remain unchanged and fail open.
         if callable(self.process_pending):
             try:
-                if any(row.get("state") == "pending" for row in self.store.events()):
+                if callable(self.has_pending):
+                    pending = self.has_pending()
+                else:
+                    pending = any(row.get("state") == "pending" for row in self.store.events())
+                if pending:
                     self.process_pending()
             except Exception:
                 log.warning("Jev default scope pending processing skipped", exc_info=True)
@@ -3704,7 +3710,16 @@ class Consumer:
                 latest[trigger_id] = row
         return latest
 
-    def _eligible(self, event: Mapping[str, Any]) -> bool:
+    def _eligible(self, event: Mapping[str, Any], latest: dict[str, dict[str, Any]] | None = None) -> bool:
+        # The ledger lookup is cheap and rejects already-attempted events, so
+        # it runs before the comparatively expensive projection validation.
+        # All conditions are conjunctive; the order does not change the result.
+        if latest is None:
+            latest = self._latest_ledger()
+        event_key = event.get("event_key")
+        existing = latest.get(event_key)
+        if existing is not None and existing.get("state") in self._ATTEMPT_STATES:
+            return False
         if not _event_projection_is_eligible(event):
             return False
         if event.get("schema_version") == SCHEMA_VERSION:
@@ -3712,11 +3727,6 @@ class Consumer:
                 _decision_input_from_event(event)
             except (BridgeValidationError, TypeError, ValueError):
                 return False
-        latest = self._latest_ledger()
-        event_key = event.get("event_key")
-        existing = latest.get(event_key)
-        if existing is not None and existing.get("state") in self._ATTEMPT_STATES:
-            return False
         run_key = f"{event['task_id']}:{event['run_id']}"
         run_rows = self._counted_rows([row for row in latest.values() if row.get("run_key") == run_key])
         return len(run_rows) < min(MAX_CALLS_PER_RUN, MAX_LIVE_CALLS_PER_RUN)
@@ -3927,10 +3937,27 @@ class Consumer:
         })
         return {"decision": decision, "effect": effect, "trigger": trigger}
 
+    def has_unprocessed_pending(self) -> bool:
+        """Cheap check: is any pending event still without an attempt row?
+
+        events.jsonl rows keep ``state == "pending"`` permanently; completion is
+        recorded in the ledger.  Checking only the event state therefore
+        reports work on every call.  This reads the event file and ledger once.
+        """
+        latest = self._latest_ledger()
+        for event in self.store.events():
+            if event.get("state") != "pending":
+                continue
+            existing = latest.get(event.get("event_key"))
+            if existing is None or existing.get("state") not in self._ATTEMPT_STATES:
+                return True
+        return False
+
     def process_pending(self) -> bool:
         prior_reviews = self.store.reviews()
+        latest = self._latest_ledger()
         for event in self.store.events():
-            if event.get("state") != "pending" or not self._eligible(event):
+            if event.get("state") != "pending" or not self._eligible(event, latest):
                 continue
             with self._lock:
                 if not self._reserve(event):
@@ -4241,7 +4268,7 @@ def register(ctx: Any) -> None:
     elif role == "consumer" and profile == "default" and profile in consumer_profiles:
         store = BridgeStore(root)
         consumer = Consumer(ctx, store)
-        scope_guard = DefaultScopeGuard(ctx, store, process_pending=consumer.process_pending)
+        scope_guard = DefaultScopeGuard(ctx, store, process_pending=consumer.process_pending, has_pending=consumer.has_unprocessed_pending)
         scope_guard.attach_consumer(consumer)
         consumer.scope_guard = scope_guard
         ctx.register_tool(
