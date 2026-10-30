@@ -69,6 +69,9 @@ def register(ctx):
 
         register_task_input_staging(ctx)
     ctx.register_hook("on_kanban_worker_spawned", lambda **kwargs: _record_worker_spawned_binding(ctx, **kwargs))
+    from .workload_split import register_workload_split
+
+    register_workload_split(ctx)
     goal_store = _request_goals.RequestGoalStore(Path(root) / "request-goals.jsonl")
     _request_goals.register_request_goal_route(ctx, goal_store)
     advisor = TargetedReadingAdvisor(ctx, _bridge.BridgeStore(root), profile_name=profile)

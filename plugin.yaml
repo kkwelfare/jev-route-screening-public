@@ -7,6 +7,7 @@ provides_tools:
   - jev_stage_task_input
   - jev_sufficiency
   - jev_search_advice
+  - jev_workload_split
   - request_goal_offer_initial
   - request_goal_bind
   - request_goal_propose_amendment

@@ -42,6 +42,7 @@ The plugin adds a Jev checkpoint bridge for two bounded paths:
 
 - Worker checkpoints: the producer hook records a projection of worker progress and evidence references without persisting raw tool content.
 - Targeted Hermes reading: the default consumer can request an advisory route for the smallest `hermes-agent` reference bundle and attach that advisory to an exact `skill_view` result.
+- Workload split signal: the default consumer gets `jev_workload_split`, an advisory check to call before creating a Kanban card or delegating a subtask. When the request states an explicit target count, a local rule answers (more than 3 targets -> `recommend_split`) without calling Jev. Otherwise Jev answers three Noul questions (more than ten items to handle, longer than the stated runtime limit, divisible into independently acceptable parts); code maps them with 0.7/0.3 thresholds to `recommend_split`, `consider_runtime`, or `proceed`. Provider failure, malformed answers, and unsettled answers return `proceed`; the tool never blocks creation. Each call appends a metadata row (signal, counts, label, summary hash — not the summary text) to `workload-split.jsonl` under the bridge directory for later outcome comparison.
 - Optional task-input staging: when explicitly enabled for the default consumer, a distinct tool creates a Kanban task blocked, binds `provenance.task_id` to the generated ID, persists and reads back the versioned marker, then unblocks it. This transports input only; Jev remains advisory and the tool does not change normal task creation.
 
 The route labels and reference manifest are local allowlisted values. A Jev response cannot execute a tool, select an arbitrary file, change permissions, mutate skills/configuration, or replace the host's worker/skill authority.
@@ -152,7 +153,8 @@ From the repository root:
 python3 test_transform_tool_result_delivery.py
 python3 test_plugin_manager_smoke.py
 python3 test_task_input_staging.py
-python3 -m py_compile bridge.py skill_router.py __init__.py task_input_staging.py test_*.py
+python3 -m unittest test_workload_split
+python3 -m py_compile bridge.py skill_router.py __init__.py task_input_staging.py workload_split.py test_*.py
 hermes plugins validate --json "$PWD"
 hermes plugins doctor --ci "$PWD"
 ```
