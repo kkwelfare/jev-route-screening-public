@@ -39,12 +39,17 @@ class Context:
         self.hooks.setdefault(name, []).append(callback)
 
 
-def response(many, runtime, divisible):
-    return {"answers": {
+def response(many, runtime, divisible, synthesis=0.1, quantitative=0.1):
+    answers = {
         "many_items": {"type": "noul", "noul": many},
         "exceeds_runtime": {"type": "noul", "noul": runtime},
         "divisible": {"type": "noul", "noul": divisible},
-    }}
+    }
+    if synthesis is not None:
+        answers["cross_source_synthesis"] = {"type": "noul", "noul": synthesis}
+    if quantitative is not None:
+        answers["quantitative_analysis"] = {"type": "noul", "noul": quantitative}
+    return {"answers": answers}
 
 
 class Sender:
@@ -79,11 +84,50 @@ class WorkloadSplitTests(unittest.TestCase):
     def test_count_rule_skips_jev(self):
         sender = Sender()
         over = self.run_tool({"request_summary": "Fix five skills", "target_count": 5, "executor": "delegation"}, sender)
-        within = self.run_tool({"request_summary": "Fix two skills", "target_count": 3, "executor": "delegation"}, sender)
         self.assertEqual((over["signal"], over["route"]), ("recommend_split", "count_rule"))
-        self.assertEqual(within["signal"], "proceed")
+        self.assertEqual(over["model_signal"], "not_judged")
         self.assertEqual(sender.calls, [])
-        self.assertEqual(len(self.log_rows()), 2)
+        self.assertEqual(len(self.log_rows()), 1)
+
+    def test_count_within_threshold_keeps_rule_and_asks_model_judgment(self):
+        # Jev says large and divisible, but the stated count settles the split signal.
+        sender = Sender(response(0.9, 0.9, 0.1, synthesis=0.9))
+        within = self.run_tool({"request_summary": "Compare two laws", "target_count": 2, "executor": "kanban_research"}, sender)
+        self.assertEqual((within["signal"], within["reason_code"], within["route"]), ("proceed", "count_within_threshold", "count_rule"))
+        self.assertEqual(within["model_signal"], "consider_stronger_model")
+        self.assertEqual(len(sender.calls), 1)
+        failed = self.run_tool({"request_summary": "Fix two skills", "target_count": 3, "executor": "delegation"},
+                               Sender(bridge.JevRequestError("http_error", 400)))
+        self.assertEqual((failed["signal"], failed["reason_code"], failed["route"]), ("proceed", "count_within_threshold", "count_rule"))
+        self.assertEqual(failed["model_signal"], "not_judged")
+
+    def test_model_signal_truth_table(self):
+        cases = [
+            # (divisible, synthesis, quantitative) -> model_signal, reason
+            ((0.1, 0.9, 0.1), "consider_stronger_model", "jev_cross_source_synthesis"),
+            ((0.1, 0.1, 0.9), "consider_stronger_model", "jev_quantitative_analysis"),
+            ((0.5, 0.9, 0.9), "consider_stronger_model", "jev_synthesis_and_quantitative"),
+            ((0.9, 0.9, 0.9), "none", "jev_divisible"),
+            ((0.1, 0.5, 0.6), "none", "jev_no_hard_judgment"),
+            ((0.1, 0.1, 0.1), "none", "jev_no_hard_judgment"),
+        ]
+        for (divisible, synthesis, quantitative), expected, reason in cases:
+            with self.subTest(divisible=divisible, synthesis=synthesis, quantitative=quantitative):
+                result = self.run_tool({"request_summary": "Assess a policy", "executor": "kanban_research"},
+                                       Sender(response(0.1, 0.1, divisible, synthesis, quantitative)))
+                self.assertEqual((result["model_signal"], result["model_reason_code"]), (expected, reason))
+                self.assertEqual(result["signal"], "proceed")
+
+    def test_legacy_three_answer_response_keeps_split_signal(self):
+        result = self.run_tool({"request_summary": "Big list", "executor": "kanban_research"},
+                               Sender(response(0.9, 0.9, 0.9, synthesis=None, quantitative=None)))
+        self.assertEqual(result["signal"], "recommend_split")
+        self.assertEqual((result["model_signal"], result["model_reason_code"]), ("not_judged", "jev_model_judgment_missing"))
+
+    def test_model_signal_is_logged(self):
+        self.run_tool({"request_summary": "Assess a policy", "executor": "kanban_research", "label": "t_x"},
+                      Sender(response(0.1, 0.1, 0.1, 0.9, 0.1)))
+        self.assertEqual(self.log_rows()[0]["model_signal"], "consider_stronger_model")
 
     def test_jev_route_truth_table(self):
         cases = [
@@ -99,11 +143,11 @@ class WorkloadSplitTests(unittest.TestCase):
                 self.assertEqual(result["signal"], expected)
                 self.assertEqual(result["route"], "jev")
 
-    def test_request_shape_has_three_nouls_and_no_ids(self):
+    def test_request_shape_has_five_nouls_and_no_ids(self):
         sender = Sender(response(0.1, 0.1, 0.1))
         self.run_tool({"request_summary": "Summarize one page", "executor": "kanban_research", "label": "t_x", "runtime_limit_minutes": 30}, sender)
         body = sender.calls[0][1]
-        self.assertEqual(set(body["questions"]), {"many_items", "exceeds_runtime", "divisible"})
+        self.assertEqual(set(body["questions"]), {"many_items", "exceeds_runtime", "divisible", "cross_source_synthesis", "quantitative_analysis"})
         self.assertTrue(all(q["type"] == "noul" for q in body["questions"].values()))
         self.assertEqual(body["state"], {"request": {"summary": "Summarize one page", "runtime_limit_minutes": 30}})
 
@@ -111,6 +155,7 @@ class WorkloadSplitTests(unittest.TestCase):
         failure = self.run_tool({"request_summary": "x", "executor": "other"},
                                 Sender(bridge.JevRequestError("http_error", 400)))
         self.assertEqual((failure["signal"], failure["reason_code"]), ("proceed", "jev_unavailable"))
+        self.assertEqual(failure["model_signal"], "not_judged")
         malformed = self.run_tool({"request_summary": "x", "executor": "other"}, Sender({"answers": {}}))
         self.assertEqual(malformed["signal"], "proceed")
 

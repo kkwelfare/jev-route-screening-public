@@ -1,9 +1,12 @@
 """Advisory workload-split signal for Default before Kanban creation or delegation.
 
-Decision logic lives in code (``decide``); Jev only answers three Noul
-judgments when the request does not state an explicit target count.
-The result is a signal for Default.  It never blocks creation or delegation:
-provider failure or an unsettled answer returns ``proceed``.
+Decision logic lives in code (``decide`` and ``decide_model``); Jev only answers
+Noul judgments.  Three size judgments feed the split signal and two difficulty
+judgments feed the model signal.  An explicit target count above the threshold
+answers the split signal without Jev.
+The result is a signal for Default.  It never blocks creation or delegation and
+never selects a model: provider failure or an unsettled answer returns
+``proceed`` and ``model_signal: not_judged`` or ``none``.
 """
 
 from __future__ import annotations
@@ -67,7 +70,32 @@ QUESTIONS: dict[str, dict[str, Any]] = {
             "false": "The parts only make sense together, such as one argument or one combined judgment.",
         },
     },
+    "cross_source_synthesis": {
+        "type": "noul",
+        "instructions": (
+            "Does finishing the work in `request.summary` require weighing what several separate "
+            "sources say against each other to reach one conclusion?"
+        ),
+        "criteria": {
+            "true": "The conclusion depends on comparing or reconciling different documents, such as a law, an official notice, statistics, and reports that must be read against each other.",
+            "false": "The result can be taken from one source, or each source is recorded separately without being weighed against the others.",
+        },
+    },
+    "quantitative_analysis": {
+        "type": "noul",
+        "instructions": (
+            "Does finishing the work in `request.summary` require calculating or estimating "
+            "numbers that no source states directly?"
+        ),
+        "criteria": {
+            "true": "The worker must compute, estimate, or model figures, such as totals, rates, projections, or cost comparisons.",
+            "false": "Any numbers needed can be copied from a source as stated.",
+        },
+    },
 }
+
+SIZE_KEYS = ("many_items", "exceeds_runtime", "divisible")
+MODEL_KEYS = ("cross_source_synthesis", "quantitative_analysis")
 
 
 def _clean(value: Any, name: str, limit: int, *, required: bool) -> str:
@@ -117,14 +145,23 @@ def parse_response(value: Any, *, transport: str | None = None) -> dict[str, flo
     try:
         answers = value["answers"]
         out: dict[str, float] = {}
-        for key in QUESTIONS:
+        for key in SIZE_KEYS:
             noul = answers[key]["noul"]
             if isinstance(noul, bool) or not isinstance(noul, (int, float)) or not 0 <= float(noul) <= 1:
                 raise ValueError
             out[key] = float(noul)
-        return out
     except (KeyError, TypeError, ValueError):
         raise bridge.JevRequestError("malformed_response")
+    # The difficulty judgments are an added advisory field: a response without
+    # them keeps the split signal and leaves the model signal unjudged.
+    for key in MODEL_KEYS:
+        try:
+            noul = answers[key]["noul"]
+        except (KeyError, TypeError):
+            continue
+        if not isinstance(noul, bool) and isinstance(noul, (int, float)) and 0 <= float(noul) <= 1:
+            out[key] = float(noul)
+    return out
 
 
 def _band(value: float) -> str:
@@ -147,6 +184,27 @@ def decide(nouls: Mapping[str, float]) -> tuple[str, str]:
     if small:
         return "proceed", "jev_small"
     return "proceed", "jev_unsettled"
+
+
+def decide_model(nouls: Mapping[str, float]) -> tuple[str, str]:
+    """Truth table: (model_signal, model_reason_code).
+
+    A stronger model is worth considering only for work that is one combined
+    judgment: divisible work is handled by splitting instead.
+    """
+    if any(key not in nouls for key in MODEL_KEYS):
+        return "not_judged", "jev_model_judgment_missing"
+    if _band(nouls["divisible"]) == "yes":
+        return "none", "jev_divisible"
+    synthesis = _band(nouls["cross_source_synthesis"]) == "yes"
+    quantitative = _band(nouls["quantitative_analysis"]) == "yes"
+    if synthesis and quantitative:
+        return "consider_stronger_model", "jev_synthesis_and_quantitative"
+    if synthesis:
+        return "consider_stronger_model", "jev_cross_source_synthesis"
+    if quantitative:
+        return "consider_stronger_model", "jev_quantitative_analysis"
+    return "none", "jev_no_hard_judgment"
 
 
 _LOG_LOCK = threading.Lock()
@@ -187,10 +245,9 @@ def workload_split_tool(
         "summary_sha256": hashlib.sha256(clean["request_summary"].encode("utf-8")).hexdigest()[:16],
     }
     count = clean["target_count"]
-    if count is not None:
-        signal = "recommend_split" if count > COUNT_SPLIT_THRESHOLD else "proceed"
-        reason = "count_over_threshold" if signal == "recommend_split" else "count_within_threshold"
-        result = {"signal": signal, "reason_code": reason, "route": "count_rule", "request_id": request_id}
+    if count is not None and count > COUNT_SPLIT_THRESHOLD:
+        result = {"signal": "recommend_split", "reason_code": "count_over_threshold", "route": "count_rule",
+                  "model_signal": "not_judged", "model_reason_code": "count_rule_split", "request_id": request_id}
         _append_log(root, {**row, **result})
         return bridge._json(result)
 
@@ -209,15 +266,24 @@ def workload_split_tool(
         failure = exc.reason
     except Exception as exc:  # fail open to Default; never expose provider payloads
         failure = type(exc).__name__
+    # A stated count within the threshold settles the split signal by rule;
+    # Jev is still asked so the difficulty judgments are available.
+    by_count = count is not None
     if nouls is None:
-        result = {"signal": "proceed", "reason_code": "jev_unavailable", "route": "jev", "failure": str(failure)[:64], "request_id": request_id}
+        result = {"signal": "proceed", "reason_code": "count_within_threshold" if by_count else "jev_unavailable",
+                  "route": "count_rule" if by_count else "jev",
+                  "model_signal": "not_judged", "model_reason_code": "jev_unavailable",
+                  "failure": str(failure)[:64], "request_id": request_id}
         _append_log(root, {**row, **result})
         return bridge._json(result)
-    signal, reason = decide(nouls)
+    signal, reason = ("proceed", "count_within_threshold") if by_count else decide(nouls)
+    model_signal, model_reason = decide_model(nouls)
     result = {
         "signal": signal,
         "reason_code": reason,
-        "route": "jev",
+        "route": "count_rule" if by_count else "jev",
+        "model_signal": model_signal,
+        "model_reason_code": model_reason,
         "nouls": {key: round(value, 3) for key, value in nouls.items()},
         "request_id": request_id,
     }
@@ -230,10 +296,12 @@ def tool_schema() -> dict[str, Any]:
     return {
         "name": TOOL_NAME,
         "description": (
-            "Advisory split signal before creating a research/docs Kanban card or a delegate_task child. "
-            "If target_count is given, a count rule answers (more than 3 -> recommend_split) without Jev. "
-            "Otherwise Jev judges size and divisibility. Signals: recommend_split, consider_runtime, proceed. "
-            "Default decides; this tool never blocks creation, and failure returns proceed."
+            "Advisory split and model signals before creating a research/docs Kanban card or a delegate_task child. "
+            "A target_count above 3 answers recommend_split by rule without Jev; a target_count of 3 or less answers proceed. "
+            "Otherwise Jev judges size and divisibility. signal: recommend_split, consider_runtime, proceed. "
+            "model_signal: consider_stronger_model when the work is one combined judgment that needs "
+            "cross-source synthesis or quantitative analysis; none; not_judged when Jev was not asked or failed. "
+            "Default decides both; this tool never blocks creation and never selects a model, and failure returns proceed."
         ),
         "parameters": {
             "type": "object",
@@ -257,5 +325,5 @@ def register_workload_split(ctx: Any) -> None:
         toolset=TOOL_NAME,
         schema=tool_schema(),
         handler=lambda args, **kwargs: workload_split_tool(args, ctx=ctx),
-        description="Advisory workload-split signal before Kanban creation or delegation; never blocks.",
+        description="Advisory workload-split and model signals before Kanban creation or delegation; never blocks.",
     )
